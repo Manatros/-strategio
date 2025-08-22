@@ -1,6 +1,6 @@
 # Strategio Project Overview
 
-Welcome to **Strategio**! This document will help you (as a team member or newcomer) quickly understand the project structure, each file’s role, and how to get started.
+Welcome to **Strategio**!.
 
 ---
 
