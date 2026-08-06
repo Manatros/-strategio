@@ -1,8 +1,8 @@
 // src/econ/resources.ts
-export type Resource = "Wood" | "Stone" | "Bread" | "Fish";
+export type Resource = "Wood" | "Stone" | "Bread" | "Fish" | "Gold";
 export type Bank = Record<Resource, number>;
 
-export const emptyBank = (): Bank => ({ Wood: 0, Stone: 0, Bread: 0, Fish: 0 });
+export const emptyBank = (): Bank => ({ Wood: 0, Stone: 0, Bread: 0, Fish: 0, Gold: 0 });
 
 export function canAfford(bank: Bank, cost: Partial<Bank>): boolean {
   for (const k of Object.keys(cost) as Resource[]) {

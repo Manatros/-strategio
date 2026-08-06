@@ -7,9 +7,12 @@
     "start": "node src/index.js"
   },
   "dependencies": {
+    "better-sqlite3": "^13.0.3",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "nanoid": "^5.1.5",
+    "openid": "^2.0.17",
+    "pg": "^8.22.0",
     "ws": "^8.18.0"
   }
 }

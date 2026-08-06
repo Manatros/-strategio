@@ -3,7 +3,7 @@ import type { Tile } from "./types";
 
 export const isPassable = (t: Tile | undefined) => {
   if (!t) return false;
-  return t.kind !== "Water" && t.kind !== "Snow";
+  return t.kind !== "Water" && t.kind !== "Snow" && t.kind !== "HighMountain";
 };
 
 // 6 axial directions (matching neighbors order)
