@@ -2,7 +2,7 @@
 // Garrison-equivalent, moving them, and merging 3 into a stronger one.
 import { send } from "../net/wire.js";
 import { key, hexDistance, canEnterTerrain } from "../world/hex.js";
-import { UNIT_DEFS, UNIT_RACE_RESTRICTION, MAX_UNIT_LEVEL, UNITS_TO_MERGE, LEVEL_MULTIPLIER, TRAINING_TICKS } from "../config/balance.js";
+import { UNIT_DEFS, UNIT_RACE_RESTRICTION, MAX_UNIT_LEVEL, UNITS_TO_MERGE, LEVEL_MULTIPLIER, TRAINING_TICKS, TRAINING_BUILDING } from "../config/balance.js";
 import { raceOf, RACE_UNIT_OVERRIDES, resolveUnitDef } from "../world/races.js";
 import { applyResearchHpBonus } from "./research.js";
 import { tryCaptureWarehouse } from "./combat.js";
@@ -21,8 +21,9 @@ export function handleTrainUnit(room, player, msg) {
   if (!Number.isFinite(q) || !Number.isFinite(r)) return;
 
   const building = room.buildings.get(key(q, r));
-  if (!building || building.kind !== "Garrison" || building.ownerId !== player.id) {
-    return send(ws, "build_rejected", { reason: "not_your_garrison" });
+  const requiredBuildingKind = TRAINING_BUILDING[kind] || "Garrison";
+  if (!building || building.kind !== requiredBuildingKind || building.ownerId !== player.id) {
+    return send(ws, "build_rejected", { reason: `not_your_${requiredBuildingKind.toLowerCase()}` });
   }
   if (!building.constructed) return send(ws, "build_rejected", { reason: "still_constructing" });
   if (building.pendingTrain) return send(ws, "build_rejected", { reason: "already_training" });
@@ -47,7 +48,7 @@ export function handleTrainUnit(room, player, msg) {
 /** Advances every Garrison's in-progress training queue by one tick, spawning the unit once it completes. */
 export function advanceTraining(room) {
   for (const building of room.buildings.values()) {
-    if (building.kind !== "Garrison" || !building.pendingTrain) continue;
+    if (!building.pendingTrain) continue;
     building.pendingTrain.ticksRemaining -= 1;
     if (building.pendingTrain.ticksRemaining > 0) continue;
 
@@ -61,7 +62,7 @@ export function advanceTraining(room) {
     const def = resolveUnitDef(player.race, kind, UNIT_DEFS, RACE_UNIT_OVERRIDES);
     if (!def) continue;
     const boostedDef = applyResearchHpBonus(player, kind, def);
-    const unit = { id: uid(), kind, level: 1, guard: false, q: spawn.q, r: spawn.r, lastStepAt: 0, lastActionAt: 0, hp: boostedDef.hp, maxHp: boostedDef.hp };
+    const unit = { id: uid(), kind, level: 1, guard: false, q: spawn.q, r: spawn.r, lastStepAt: 0, lastActionAt: 0, hp: boostedDef.hp, maxHp: boostedDef.hp, popCost: def.popCost || 1 };
     player.units.set(unit.id, unit);
 
     const ws = room.clients.get(playerId);
@@ -130,8 +131,10 @@ export function handleMergeUnits(room, player, msg) {
     if (!baseDef) continue;
     const newMaxHp = Math.max(1, Math.round(baseDef.hp * (LEVEL_MULTIPLIER[newLevel] || 1)));
 
-    for (const id of ids.slice(0, UNITS_TO_MERGE)) player.units.delete(id);
-    const merged = { id: uid(), kind, level: newLevel, guard: false, q, r, lastStepAt: 0, lastActionAt: 0, hp: newMaxHp, maxHp: newMaxHp };
+    const consumedIds = ids.slice(0, UNITS_TO_MERGE);
+    const reservedPop = consumedIds.reduce((sum, id) => sum + (player.units.get(id)?.popCost || 0), 0);
+    for (const id of consumedIds) player.units.delete(id);
+    const merged = { id: uid(), kind, level: newLevel, guard: false, q, r, lastStepAt: 0, lastActionAt: 0, hp: newMaxHp, maxHp: newMaxHp, popCost: reservedPop };
     player.units.set(merged.id, merged);
     mergedAny = true;
   }

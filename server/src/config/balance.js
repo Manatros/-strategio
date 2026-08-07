@@ -29,17 +29,19 @@ export const TOWNHALL_STORAGE_BONUS = 20; // each constructed TownHall adds this
 export const WAREHOUSE_STORAGE_BONUS = 50; // each constructed Warehouse adds this much, per resource
 
 export const BUILD_COST = {
-  TownHall:    { Wood: 15, Stone: 15 },
-  Lumberjack:  { Wood: 15, Stone: 10 },
+  TownHall:    { Wood: 20, Stone: 20 },
+  Lumberjack:  { Wood: 0, Stone: 10 },
   Farm:        { Wood: 10, Stone: 10 },
-  Mine:        { Wood: 10, Stone: 20 },
-  FishingBoat: { Wood: 18 },
-  Bridge:      { Wood: 8 },
+  Mine:        { Wood: 10, Stone: 0 },
+  FishingBoat: { Wood: 20 },
+  Bridge:      { Wood: 5 },
   House:       { Bread: 15 },
-  Garrison:    { Wood: 25, Stone: 20 },
+  Garrison:    { Wood: 50, Stone: 100 },
   ArcherTower: { Wood: 20, Stone: 25 },
-  Research:    { Wood: 25, Stone: 15, Bread: 10 },
-  Warehouse:   { Wood: 30, Stone: 20 },
+  Research:    { Wood: 50, Stone: 50 },
+  Warehouse:   { Wood: 50, Stone: 50 },
+  Outpost:     { Wood: 20, Stone: 10 },        // trains Settlers and Builders
+  Church:      { Wood: 30, Stone: 15, Bread: 15 }, // trains Priests
 };
 
 // Tiered by how gated/valuable the resource is downstream — Wood is needed
@@ -90,6 +92,8 @@ export const BUILDING_HEALTH = {
   ArcherTower: 30,
   Research: 20,
   Warehouse: 40,
+  Outpost: 15,
+  Church: 20,
 };
 
 // ---- Units ----------------------------------------------------------
@@ -99,7 +103,19 @@ export const UNIT_DEFS = {
   Archer:     { cost: { Wood: 12, Fish: 6 }, popCost: 1, minUsedWorkers: 2, hp: 10 }, // 3x Soldier's range, so priced/gated to match rather than undercut it
   Settler:    { cost: { Wood: 20, Bread: 20 }, popCost: 2, minUsedWorkers: 0, hp: 10 }, // consumed founding a new TownHall
   Necromancer:{ cost: { Bread: 20, Stone: 10 }, popCost: 2, minUsedWorkers: 2, hp: 20 }, // Undead only; base hp set high since Undead's -80% multiplier hits this hard (see races.js)
+  Priest:     { cost: { Bread: 15, Gold: 10 }, popCost: 1, minUsedWorkers: 0, hp: 12 }, // trained at Church -- cleanses scorched earth, captures buildings by standing on them
+  Builder:    { cost: { Wood: 15 }, popCost: 1, minUsedWorkers: 0, hp: 8 }, // trained at Outpost -- can place buildings like the player character can
 };
+
+/** Which building trains which unit — training used to be Garrison-only; Settler/Builder/Priest have their own. */
+export const TRAINING_BUILDING = {
+  Scout: "Garrison", Soldier: "Garrison", Archer: "Garrison", Necromancer: "Garrison", Brawler: "Garrison",
+  Settler: "Outpost", Builder: "Outpost",
+  Priest: "Church",
+};
+
+/** How long a Priest must stand still on an enemy building to capture it. */
+export const PRIEST_CAPTURE_TICKS = 10;
 
 /** Units restricted to a single race, beyond the shared roster every race can train. */
 export const UNIT_RACE_RESTRICTION = { Necromancer: "Undead", Brawler: "Orc" };
@@ -113,6 +129,8 @@ export const TRAINING_TICKS = {
   Settler: 8,       // 4s — founds a whole new town, worth the wait
   Necromancer: 10,  // 5s — Undead's elite unit
   Brawler: 10,      // 5s — Orc's elite unit
+  Priest: 8,        // 4s
+  Builder: 6,       // 3s
 };
 
 /** Buildings that don't need an assigned worker — TownHall anchors territory, House is what creates population in the first place. */

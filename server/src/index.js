@@ -8,7 +8,7 @@ import { log } from "./utils/logger.js";
 import { send, safeJSON } from "./net/wire.js";
 import { RoomManager } from "./rooms/RoomManager.js";
 import { uid } from "./utils/uid.js";
-import { upsertIdentity, getHighscores, getOwnedRaces, grantRaceEntitlement, getPlayerRecord } from "./persist/store.js";
+import { upsertIdentity, getHighscores, getOwnedRaces, grantRaceEntitlement, getPlayerRecord, registerAccount, verifyAccountLogin, getIsAdmin, setAdmin } from "./persist/store.js";
 import { redirectToSteamLogin, handleSteamReturn } from "./auth/steam.js";
 import { RACES } from "./world/races.js";
 
@@ -25,6 +25,30 @@ app.get("/version", (_, res) => res.json({ protocol: cfg.protocol, tickRate: cfg
 
 const rm = new RoomManager(cfg);
 app.get("/room-stats", (_, res) => res.json({ rooms: rm.allStats() }));
+/**
+ * The real ops-monitoring surface — separate from the in-game admin debug
+ * panel on purpose (see the design note this responds to): scoped to the
+ * whole server process across every room, not to whichever one game a
+ * player happens to be connected to, and never sent over the same channel
+ * untrusted game clients talk over.
+ */
+app.get("/admin/stats", (req, res) => {
+  const secret = process.env.ADMIN_SECRET;
+  if (!secret) return res.status(503).json({ error: "ADMIN_SECRET not configured" });
+  if (req.get("x-admin-secret") !== secret) return res.status(401).json({ error: "unauthorized" });
+
+  const mem = process.memoryUsage();
+  res.json({
+    process: {
+      uptimeSec: Math.round(process.uptime()),
+      nodeVersion: process.version,
+      memoryMB: { heapUsed: Math.round(mem.heapUsed / 1024 / 1024), rss: Math.round(mem.rss / 1024 / 1024) },
+      backend: process.env.DATABASE_URL ? "postgres" : "sqlite",
+    },
+    rooms: rm.allStats(),
+  });
+});
+
 app.get("/highscores", async (_, res) => res.json({ highscores: await getHighscores(50) }));
 
 // A player looks this up before showing the race picker (and to see their own Name#tag), so
@@ -40,6 +64,45 @@ app.get("/races/:token", async (req, res) => {
 
 app.get("/auth/steam", redirectToSteamLogin);
 app.get("/auth/steam/return", handleSteamReturn);
+
+// In-memory, per-process rate limiting on login attempts — a real mitigation for a single server,
+// but (like the room/game state itself) doesn't share state across multiple processes. A multi-instance
+// deployment would want this backed by something shared (Redis, or the same database) instead.
+const loginAttempts = new Map(); // ip -> { count, resetAt }
+const LOGIN_RATE_WINDOW_MS = 5 * 60 * 1000;
+const LOGIN_RATE_MAX_ATTEMPTS = 8;
+function checkLoginRateLimit(ip) {
+  const now = Date.now();
+  const entry = loginAttempts.get(ip);
+  if (!entry || now > entry.resetAt) { loginAttempts.set(ip, { count: 1, resetAt: now + LOGIN_RATE_WINDOW_MS }); return true; }
+  if (entry.count >= LOGIN_RATE_MAX_ATTEMPTS) return false;
+  entry.count++;
+  return true;
+}
+
+/**
+ * Username/password accounts — an alternative to Steam login for players
+ * without Steam. Deliberately produces the exact same shape of result as
+ * Steam login: a stable token the client adopts as its identity. Every
+ * downstream system (progress, achievements, entitlements) only ever cares
+ * about that token string, so nothing else needed to change to support this.
+ */
+app.post("/auth/register", async (req, res) => {
+  const { username, password } = req.body || {};
+  const result = await registerAccount(username, password);
+  if (!result.ok) return res.status(400).json({ error: result.error });
+  const identity = await upsertIdentity(result.token, { name: username });
+  res.json({ token: result.token, name: identity.name, tag: identity.tag });
+});
+
+app.post("/auth/login", async (req, res) => {
+  if (!checkLoginRateLimit(req.ip)) return res.status(429).json({ error: "too_many_attempts" });
+  const { username, password } = req.body || {};
+  const result = await verifyAccountLogin(username, password);
+  if (!result.ok) return res.status(401).json({ error: result.error });
+  const identity = await upsertIdentity(result.token, {});
+  res.json({ token: result.token, name: identity.name, tag: identity.tag });
+});
 
 /**
  * Grants a race entitlement to an identity. This is the one integration
@@ -59,6 +122,18 @@ app.post("/admin/grant-race", async (req, res) => {
   }
   const granted = await grantRaceEntitlement(token, race, source || "admin");
   res.json({ granted, ownedRaces: await getOwnedRaces(token) });
+});
+
+/** Grants or revokes real admin status for an identity — the mechanism DEV_ALL_ADMIN is standing in for during development. */
+app.post("/admin/set-admin", async (req, res) => {
+  const secret = process.env.ADMIN_SECRET;
+  if (!secret) return res.status(503).json({ error: "ADMIN_SECRET not configured" });
+  if (req.get("x-admin-secret") !== secret) return res.status(401).json({ error: "unauthorized" });
+
+  const { token, isAdmin } = req.body || {};
+  if (typeof token !== "string") return res.status(400).json({ error: "token is required" });
+  await setAdmin(token, !!isAdmin);
+  res.json({ token, isAdmin: !!isAdmin });
 });
 
 app.use(express.static(FRONTEND_DIST));
@@ -109,7 +184,11 @@ async function handleHandshake(ws, msg) {
   }
 
   const room = rm.pickRoom();
-  const clientId = room.join(ws, { token, name, color, race, tag: identity.tag, ownedRaces: devUnlockAll ? null : ownedRaces });
+  // DEV_ALL_ADMIN=1 makes everyone admin, for the current development/testing phase. Once real
+  // accounts are the norm, unset this and use /admin/set-admin (or setAdmin() directly) instead —
+  // the real per-identity flag already works underneath this override, nothing else changes.
+  const isAdmin = process.env.DEV_ALL_ADMIN === "1" || await getIsAdmin(token);
+  const clientId = room.join(ws, { token, name, color, race, tag: identity.tag, ownedRaces: devUnlockAll ? null : ownedRaces, isAdmin });
   rm.registerResumable(token, room.id);
   return { room, clientId };
 }

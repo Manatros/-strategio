@@ -1,7 +1,6 @@
 // src/scene/GameScene.ts
 import * as PIXI from "pixi.js";
-import type { Scene } from "./SceneManager";
-import type { SceneManager } from "./SceneManager";
+import type { Scene, SceneManager } from "./SceneManager";
 import { GameOverScene } from "./GameOverScene";
 import { TileRenderer, type TileVisualContext } from "../hex/TileRenderer";
 import { attachHUD as attachDebugHUD } from "../ui/DebugHUD";
@@ -23,7 +22,7 @@ import { emptyBank, canAfford, type Bank } from "../econ/resources";
 import { BUILD_COST } from "../buildings/costs";
 import { toPixiColor } from "../core/color";
 import { raceDisplay } from "../core/races";
-import { WORKER_EXEMPT, ATTACK_RANGE } from "../core/balance";
+import { WORKER_EXEMPT, ATTACK_RANGE, TRAINING_BUILDING } from "../core/balance";
 import { RESEARCH_OPTIONS } from "../core/research";
 import { connectWS, type ServerMsg, type WS, type RemoteBuilding, type RemoteTile, type RemoteUnit, type RemotePlayer, type RelationStatus } from "../net";
 import type { Axial } from "../hex/types";
@@ -33,12 +32,14 @@ function fmtResources(r: Record<string, number | undefined> | null): string {
   return Object.entries(r).filter(([, v]) => v).map(([k, v]) => `${v} ${k}`).join(", ");
 }
 
+const SELF_KEY = "__self__"; // entityPaths key for the main character, distinct from any real unit id
+
 export class GameScene implements Scene {
   private app: PIXI.Application | null = null;
   private el: HTMLElement | null = null;
   private mapRenderer: TileRenderer | null = null;
   private player!: Player;
-  private plannedPath: { q: number; r: number }[] = [];
+  private entityPaths = new Map<string, Axial[]>(); // key: unitId, or SELF_KEY for the main character — each entity remembers its own queued path independently, which is what lets you control multiple units at once
 
   private fow!: FogOfWar;
   private buildings!: BuildingRenderer;
@@ -54,7 +55,6 @@ export class GameScene implements Scene {
   private otherUnits = new Map<string, PIXI.Graphics>();
   private selectedUnitId: string | null = null;
   private autoExploreUnits = new Set<string>();     // unit ids currently self-navigating toward unexplored territory
-  private unitPaths = new Map<string, Axial[]>();    // per-unit background path, independent of the manually-controlled plannedPath
   private lastExploreAttempt = new Map<string, number>(); // throttles retries when a unit can't find a reachable frontier
 
   private ui!: ReturnType<typeof createBuildHUD>;
@@ -83,6 +83,8 @@ export class GameScene implements Scene {
   private myId = "";
   private myColor = 0x3a86ff;
   private myRace = "Human";
+  private isAdmin = false;
+  private mapRevealed = false;
   private hexSize = 22;
   private visionRadius = 5;
   private stepMillis = 260; // overwritten on connect with the server's real cooldown — see awaitWelcome
@@ -132,12 +134,14 @@ export class GameScene implements Scene {
     this.updateFogVisuals();
     this.renderMinimap();
 
-    let dragging = false, lastX = 0, lastY = 0;
-    app.canvas.addEventListener("pointerdown", (e) => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+    let dragging = false, lastX = 0, lastY = 0, dragDistance = 0;
+    const DRAG_THRESHOLD = 6; // px of total movement before a pointerdown->up counts as a drag, not a click
+    app.canvas.addEventListener("pointerdown", (e) => { dragging = true; dragDistance = 0; lastX = e.clientX; lastY = e.clientY; });
     window.addEventListener("pointerup", () => { dragging = false; });
     window.addEventListener("pointermove", (e) => {
       if (!dragging || !this.mapRenderer) return;
       const dx = e.clientX - lastX; const dy = e.clientY - lastY;
+      dragDistance += Math.abs(dx) + Math.abs(dy);
       lastX = e.clientX; lastY = e.clientY;
       this.mapRenderer.container.x += dx;
       this.mapRenderer.container.y += dy;
@@ -156,17 +160,20 @@ export class GameScene implements Scene {
       const label = rd.buildingNames[kind];
       if (label) btn.textContent = label;
     }
+    const extraTrainableKinds = this.myRace === "Undead" ? ["Necromancer"] : this.myRace === "Orc" ? ["Brawler"] : [];
     this.unitUi = createUnitHUD(
       root,
       (id) => { this.selectedUnitId = id; this.refreshUnitPanel(); },
       (kind) => this.tryTrainUnit(kind),
       () => this.tryMergeUnits(),
       () => this.toggleAutoExplore(),
-      () => this.toggleGuard()
+      () => this.toggleGuard(),
+      extraTrainableKinds
     );
-    if (rd.unitNames.Scout) this.unitUi.trainScoutBtn.textContent = rd.unitNames.Scout;
-    if (rd.unitNames.Soldier) this.unitUi.trainSoldierBtn.textContent = rd.unitNames.Soldier;
-    if (rd.unitNames.Archer) this.unitUi.trainArcherBtn.textContent = rd.unitNames.Archer;
+    for (const kind of Object.keys(this.unitUi.trainBtns)) {
+      const label = rd.unitNames[kind];
+      if (label) this.unitUi.trainBtns[kind].textContent = label;
+    }
     updateBuildTooltips(this.ui, this.buildCost);
     updateTrainTooltips(this.unitUi, this.unitCost);
     this.refreshUnitPanel();
@@ -185,7 +192,14 @@ export class GameScene implements Scene {
       this.mapRenderer!.container.x = -x + innerWidth / 2;
       this.mapRenderer!.container.y = -y + innerHeight / 2;
     });
-    this.dbg = attachDebugHUD(root);
+    this.dbg = attachDebugHUD(root, this.isAdmin);
+    this.ws.onDebugLog((entry) => this.dbg.appendLog(entry));
+    this.dbg.onCheatApply((amounts) => this.ws.adminCheatResources(amounts));
+    this.dbg.onRevealToggle((reveal) => {
+      this.mapRevealed = reveal;
+      this.ws.adminToggleReveal(reveal);
+      this.updateFogVisuals(); // take effect immediately, don't wait for the next natural fog recalc
+    });
     this.dbg.onCenter(() => {
       const b = this.mapRenderer!.container.getLocalBounds();
       this.mapRenderer!.container.x = -b.x + innerWidth / 2 - b.width / 2;
@@ -205,6 +219,7 @@ export class GameScene implements Scene {
     app.canvas.addEventListener("pointerleave", () => { this.mapRenderer?.hideHighlight(); this.ghost.visible = false; });
 
     app.canvas.addEventListener("click", (e) => {
+      if (dragDistance > DRAG_THRESHOLD) return; // this click is really the release of a map drag, not an intentional click
       const world = this.screenToWorld(e.clientX, e.clientY);
       const target = pixelToAxial(world.x, world.y, this.hexSize);
       const isAdj = this.hexAdj(this.player.pos, target);
@@ -214,7 +229,7 @@ export class GameScene implements Scene {
       if (this.buildKind) {
         const cost = this.buildCost[this.buildKind] || {};
         const onSelf = target.q === this.player.pos.q && target.r === this.player.pos.r;
-        const nearRequirement = this.buildKind === "TownHall" ? this.nearOwnSettler(target) : (isAdj || onSelf);
+        const nearRequirement = this.buildKind === "TownHall" ? this.nearOwnSettler(target) : (isAdj || onSelf || this.nearOwnBuilder(target));
         if (vis === "visible" && nearRequirement && this.canBuildOn(this.buildKind, tile) && canAfford(this.bank, cost)) {
           this.ws.placeBuilding(this.buildKind, target.q, target.r);
         } else {
@@ -268,14 +283,16 @@ export class GameScene implements Scene {
 
       if (!tile || vis === "hidden") return;
       const entity = this.activeEntity();
-      const queueing = e.shiftKey && this.plannedPath.length > 0;
+      const activeKey = this.activeKey();
+      const existingPath = this.entityPaths.get(activeKey) ?? [];
+      const queueing = e.shiftKey && existingPath.length > 0;
       const from = queueing
-        ? this.plannedPath[this.plannedPath.length - 1]
+        ? existingPath[existingPath.length - 1]
         : ((entity.state.kind === "idle") ? entity.state.at : entity.state.to);
-      const path = bfsPath((k) => this.tiles.get(k), from, target, 400, (t) => this.canEnterTile(t));
+      const path = bfsPath((k) => this.tiles.get(k), from, target, 4000, (t) => this.canEnterTile(t));
       if (path && path.length > 1) {
-        if (queueing) this.plannedPath.push(...path.slice(1));
-        else this.plannedPath = path.slice(1);
+        if (queueing) this.entityPaths.set(activeKey, [...existingPath, ...path.slice(1)]);
+        else this.entityPaths.set(activeKey, path.slice(1));
       }
     });
 
@@ -304,8 +321,7 @@ export class GameScene implements Scene {
       }
       if (e.key.toLowerCase() === "s") {
         // Stop: clear the active entity's queued movement.
-        this.plannedPath = [];
-        if (this.selectedUnitId) this.unitPaths.delete(this.selectedUnitId);
+        this.entityPaths.set(this.activeKey(), []);
         return;
       }
       if (e.key === "Tab") {
@@ -326,20 +342,28 @@ export class GameScene implements Scene {
       const now = performance.now();
       const dt = now - last; last = now;
 
+      const activeKey = this.activeKey();
       const activeNow = this.activeEntity();
+      const activePath = this.entityPaths.get(activeKey);
 
-      if (this.plannedPath.length > 0 && activeNow.state.kind === "idle") {
-        const next = this.plannedPath.shift()!;
-        if (!this.tryStepVisible(next.q, next.r)) this.plannedPath = [];
-      }
-
-      if (activeNow.state.kind === "idle" && this.plannedPath.length === 0) {
+      if (activePath && activePath.length > 0 && activeNow.state.kind === "idle") {
+        const next = activePath.shift()!;
+        if (!this.tryStepEntity(activeKey, activeNow, next.q, next.r)) this.entityPaths.set(activeKey, []);
+      } else if (activeNow.state.kind === "idle" && (!activePath || activePath.length === 0)) {
         const dir = this.readDirection(keys);
         if (dir) {
           const cur = activeNow.state.at;
           const to = { q: cur.q + dir.q, r: cur.r + dir.r };
           this.tryStepVisible(to.q, to.r);
         }
+      }
+
+      // Every other entity keeps moving toward wherever it was told to go, independent of whichever
+      // one is currently selected — this is what lets you actually control multiple units at once.
+      if (activeKey !== SELF_KEY) this.advanceEntityQueuedPath(SELF_KEY, this.player);
+      for (const [unitId, entity] of this.units) {
+        if (unitId === activeKey) continue;
+        this.advanceEntityQueuedPath(unitId, entity);
       }
 
       this.player.tick(dt);
@@ -363,6 +387,7 @@ export class GameScene implements Scene {
           this.visionRadius = msg.visionRadius;
           this.myColor = msg.color;
           this.myRace = msg.race;
+          this.isAdmin = msg.isAdmin;
           // A small buffer above the server's real cooldown avoids spurious "too_soon" rejections from network jitter,
           // which is what caused multi-tile paths to silently stop after 1 tile before this was synced to the server value.
           this.stepMillis = msg.stepCooldownMs + 60;
@@ -442,20 +467,18 @@ export class GameScene implements Scene {
         break;
       }
       case "step_rejected": {
+        const key = msg.unitId ?? SELF_KEY;
         if (msg.unitId) {
           const u = this.units.get(msg.unitId);
           if (u) u.snapTo(u.pos);
-          if (msg.unitId === this.selectedUnitId) {
-            if (msg.reason === "too_soon") this.plannedPath.unshift({ q: msg.q, r: msg.r });
-            else this.plannedPath = [];
-          } else {
-            // A background auto-exploring unit — drop its queued path, it'll pick a fresh target next idle tick.
-            this.unitPaths.delete(msg.unitId);
-          }
         } else {
           this.player.snapTo(this.player.pos);
-          if (msg.reason === "too_soon") this.plannedPath.unshift({ q: msg.q, r: msg.r });
-          else this.plannedPath = [];
+        }
+        if (msg.reason === "too_soon") {
+          const path = this.entityPaths.get(key) ?? [];
+          this.entityPaths.set(key, [{ q: msg.q, r: msg.r }, ...path]);
+        } else {
+          this.entityPaths.set(key, []);
         }
         console.warn(`[Strategio] step rejected: ${msg.reason}`);
         break;
@@ -468,6 +491,25 @@ export class GameScene implements Scene {
       }
       case "you_died": {
         this.sm.switch(new GameOverScene(this.sm, msg.finalScore, msg.reason));
+        break;
+      }
+      case "game_over": {
+        this.sm.switch(new GameOverScene(this.sm, msg.finalScore, msg.reason, {
+          youWon: msg.youWon, winnerName: msg.winnerName, winnerRace: msg.winnerRace, reason: msg.reason, bonus: msg.bonus,
+        }));
+        break;
+      }
+      case "achievement_unlocked": {
+        this.toasts.show({
+          id: `achievement-${msg.id}`,
+          title: `🏆 ${msg.name}`,
+          body: msg.description,
+          autoDismissMs: 8000,
+        });
+        break;
+      }
+      case "admin_debug": {
+        this.dbg.updateServerInfo(msg);
         break;
       }
       case "relations_update": {
@@ -588,7 +630,7 @@ export class GameScene implements Scene {
         this.unitLevels.delete(id);
         this.unitGuards.delete(id);
         this.autoExploreUnits.delete(id);
-        this.unitPaths.delete(id);
+        this.entityPaths.delete(id);
         this.lastExploreAttempt.delete(id);
         if (this.selectedUnitId === id) this.selectedUnitId = null;
         rosterChanged = true;
@@ -645,19 +687,31 @@ export class GameScene implements Scene {
     return false;
   }
 
-  private nearOwnGarrison(): RemoteBuilding | null {
+  /** Is one of the player's own Builder units on or next to this tile? Builders can place buildings the same way the player character can. */
+  private nearOwnBuilder(target: { q: number; r: number }): boolean {
+    for (const [id, kind] of this.unitKinds) {
+      if (kind !== "Builder") continue;
+      const u = this.units.get(id);
+      if (!u) continue;
+      if ((u.pos.q === target.q && u.pos.r === target.r) || this.hexAdj(u.pos, target)) return true;
+    }
+    return false;
+  }
+
+  private nearOwnBuildingOfKind(kind: BuildingKind): RemoteBuilding | null {
     for (const b of this.buildingSprites.values()) {
-      if (b.kind !== "Garrison" || b.ownerId !== this.myId || !b.constructed) continue;
+      if (b.kind !== kind || b.ownerId !== this.myId || !b.constructed) continue;
       const onSelf = b.q === this.player.pos.q && b.r === this.player.pos.r;
       if (onSelf || this.hexAdj(this.player.pos, { q: b.q, r: b.r })) return b;
     }
     return null;
   }
 
-  private tryTrainUnit(kind: "Scout" | "Soldier" | "Archer") {
-    const garrison = this.nearOwnGarrison();
-    if (!garrison) { console.warn("[Strategio] no ready Garrison nearby"); return; }
-    this.ws.trainUnit(kind, garrison.q, garrison.r);
+  private tryTrainUnit(kind: string) {
+    const requiredKind = TRAINING_BUILDING[kind] ?? "Garrison";
+    const building = this.nearOwnBuildingOfKind(requiredKind);
+    if (!building) { console.warn(`[Strategio] no ready ${requiredKind} nearby`); return; }
+    this.ws.trainUnit(kind, building.q, building.r);
   }
 
   private refreshUnitPanel() {
@@ -665,7 +719,8 @@ export class GameScene implements Scene {
     const list = [...this.unitKinds.entries()].map(([id, kind]) => ({
       id, kind: names[kind] || kind, level: this.unitLevels.get(id) ?? 1,
     }));
-    refreshUnitHUD(this.unitUi, list, this.selectedUnitId, !!this.nearOwnGarrison(), this.canMergeAtSelected());
+    const canTrainKind = (kind: string) => !!this.nearOwnBuildingOfKind(TRAINING_BUILDING[kind] ?? "Garrison");
+    refreshUnitHUD(this.unitUi, list, this.selectedUnitId, canTrainKind, this.canMergeAtSelected());
     const selectedKind = this.selectedUnitId ? this.unitKinds.get(this.selectedUnitId) ?? null : null;
     const guardOn = !!this.selectedUnitId && !!this.unitGuards.get(this.selectedUnitId);
     refreshAbilities(this.unitUi, selectedKind, !!this.selectedUnitId && this.autoExploreUnits.has(this.selectedUnitId), guardOn);
@@ -701,7 +756,7 @@ export class GameScene implements Scene {
     if (!this.selectedUnitId) return;
     if (this.autoExploreUnits.has(this.selectedUnitId)) {
       this.autoExploreUnits.delete(this.selectedUnitId);
-      this.unitPaths.delete(this.selectedUnitId);
+      this.entityPaths.delete(this.selectedUnitId);
     } else {
       this.autoExploreUnits.add(this.selectedUnitId);
     }
@@ -714,10 +769,10 @@ export class GameScene implements Scene {
   private advanceAutoExplore() {
     for (const [unitId, entity] of this.units) {
       if (!this.autoExploreUnits.has(unitId)) continue;
-      if (unitId === this.selectedUnitId && this.plannedPath.length > 0) continue; // player is actively manually pathing this one right now
+      if (unitId === this.selectedUnitId && (this.entityPaths.get(unitId)?.length ?? 0) > 0) continue; // player is actively manually pathing this one right now
       if (entity.state.kind !== "idle") continue;
 
-      let path = this.unitPaths.get(unitId);
+      let path = this.entityPaths.get(unitId);
       if (!path || path.length === 0) {
         const now = performance.now();
         const lastTry = this.lastExploreAttempt.get(unitId) ?? 0;
@@ -726,16 +781,16 @@ export class GameScene implements Scene {
 
         const target = this.findExploreTarget(entity.pos);
         if (!target) continue;
-        const found = bfsPath((k) => this.tiles.get(k), entity.pos, target, 400, (t) => this.canEnterTile(t));
+        const found = bfsPath((k) => this.tiles.get(k), entity.pos, target, 4000, (t) => this.canEnterTile(t));
         path = found ? found.slice(1) : [];
-        this.unitPaths.set(unitId, path);
+        this.entityPaths.set(unitId, path);
       }
       if (path.length === 0) continue;
 
       const next = path.shift()!;
       const started = entity.tryStep(next, entity.stepMillis);
       if (started) this.ws.stepUnit(unitId, next.q, next.r);
-      else this.unitPaths.set(unitId, []); // couldn't move there — recompute a fresh target next idle tick
+      else this.entityPaths.set(unitId, []); // couldn't move there — recompute a fresh target next idle tick
     }
   }
 
@@ -772,6 +827,10 @@ export class GameScene implements Scene {
     this.refreshBuildingPanel();
   }
 
+  private activeKey(): string {
+    return this.selectedUnitId ?? SELF_KEY;
+  }
+
   private activeEntity(): Player {
     if (this.selectedUnitId) {
       const u = this.units.get(this.selectedUnitId);
@@ -780,30 +839,57 @@ export class GameScene implements Scene {
     return this.player;
   }
 
-  /** Mirrors the server's terrain + territory rules for optimistic movement prediction — the server always has final say. */
-  private canEnterTile(t: RemoteTile | undefined): boolean {
-    if (t?.kind === "HighMountain" && this.myRace === "Dwarf") {
-      // Dwarves can cross HighMountain race-wide (see races.js note on this simplification) — every other check still applies.
-      if (t?.claimedBy && t.claimedBy.id !== this.myId) return false;
-      return true;
-    }
-    if (!isPassable(t)) return false;
-    if (t?.claimedBy && t.claimedBy.id !== this.myId) return false;
-    return true;
+  /** Mirrors the server's race-based relation floors (Orc always at war, Elf always open borders) on top of
+   *  explicit relations_update messages, so movement prediction matches what the server will actually allow. */
+  private getRelationTo(otherId: string): RelationStatus {
+    const otherRace = this.lastPlayers.find(p => p.id === otherId)?.race;
+    if (this.myRace === "Orc" || otherRace === "Orc") return "war";
+    const stored = this.relations.get(otherId);
+    if (stored) return stored;
+    if (this.myRace === "Elf" || otherRace === "Elf") return "open_borders";
+    return "neutral";
   }
 
-  private tryStepVisible(q: number, r: number): boolean {
+  /** Mirrors the server's terrain + territory rules for optimistic movement prediction — the server always has final say. */
+  private canEnterTile(t: RemoteTile | undefined): boolean {
+    const crossable = (claimedBy: RemoteTile["claimedBy"]) => {
+      if (!claimedBy || claimedBy.id === this.myId) return true;
+      const rel = this.getRelationTo(claimedBy.id);
+      return rel === "war" || rel === "open_borders";
+    };
+    if (t?.kind === "HighMountain" && this.myRace === "Dwarf") {
+      // Dwarves can cross HighMountain race-wide (see races.js note on this simplification) — every other check still applies.
+      return crossable(t?.claimedBy);
+    }
+    if (!isPassable(t)) return false;
+    return crossable(t?.claimedBy);
+  }
+
+  private tryStepEntity(key: string, entity: Player, q: number, r: number): boolean {
     const vis = this.fow.state(q, r);
     if (vis === "hidden") return false;
     const tile = this.tiles.get(keyFor(q, r));
     if (!tile || !this.canEnterTile(tile)) return false;
-    const entity = this.activeEntity();
     const started = entity.tryStep({ q, r }, entity.stepMillis);
     if (started) {
-      if (this.selectedUnitId) this.ws.stepUnit(this.selectedUnitId, q, r);
-      else this.ws.step(q, r);
+      if (key === SELF_KEY) this.ws.step(q, r);
+      else this.ws.stepUnit(key, q, r);
     }
     return started;
+  }
+
+  /** Advances one entity's queued path by one step, if it's idle and has one. Used for every entity that
+   *  isn't the currently-active one, so switching selection never interrupts a unit's own movement. */
+  private advanceEntityQueuedPath(key: string, entity: Player) {
+    if (entity.state.kind !== "idle") return;
+    const path = this.entityPaths.get(key);
+    if (!path || path.length === 0) return;
+    const next = path.shift()!;
+    if (!this.tryStepEntity(key, entity, next.q, next.r)) this.entityPaths.set(key, []);
+  }
+
+  private tryStepVisible(q: number, r: number): boolean {
+    return this.tryStepEntity(this.activeKey(), this.activeEntity(), q, r);
   }
 
   private updateGhost(q: number, r: number) {
@@ -811,7 +897,7 @@ export class GameScene implements Scene {
     const tile = this.tiles.get(keyFor(q, r));
     const isAdj = this.hexAdj(this.player.pos, { q, r });
     const onSelf = q === this.player.pos.q && r === this.player.pos.r;
-    const nearRequirement = this.buildKind === "TownHall" ? this.nearOwnSettler({ q, r }) : (isAdj || onSelf);
+    const nearRequirement = this.buildKind === "TownHall" ? this.nearOwnSettler({ q, r }) : (isAdj || onSelf || this.nearOwnBuilder({ q, r }));
     const ok = nearRequirement && this.canBuildOn(this.buildKind, tile);
 
     const s = this.hexSize;
@@ -902,6 +988,12 @@ export class GameScene implements Scene {
   }
 
   private updateFogVisuals() {
+    if (this.mapRevealed) {
+      const allKnown = new Set(this.tiles.keys());
+      this.mapRenderer!.setAlphaByFog(new Set(), allKnown); // nothing hidden, everything counted as seen
+      this.buildings.setAlphaForHidden(new Set(), allKnown);
+      return;
+    }
     const hidden = new Set<string>();
     for (const k of this.fow.seen) {
       if (this.fow.visible.has(k)) continue;

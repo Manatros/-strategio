@@ -2,7 +2,6 @@
 import * as PIXI from "pixi.js";
 import { axialToPixel } from "./HexMath";
 import { key, type Tile } from "./types";
-import { key as tileKey } from "./types";
 import type { RemoteTile } from "../net";
 
 const TILE_KINDS: Tile["kind"][] = ["Grass", "Stone", "Water", "Fields", "Snow", "Forest", "Bridge", "HighMountain"];
@@ -84,7 +83,7 @@ export class TileRenderer {
     }
   }
 
-  tileId(q: number, r: number) { return tileKey(q, r); }
+  tileId(q: number, r: number) { return key(q, r); }
 
   /** Materializes every tile the client currently has data for. No culling — call this whenever new tiles arrive.
    *  `context` supplies purely-visual info the tile itself doesn't carry: is something built here, is it

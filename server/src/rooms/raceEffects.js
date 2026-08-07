@@ -54,7 +54,10 @@ export function advanceScorchedEarth(room) {
       const owner = room.players.get(claim.ownerId);
       if (!owner || !raceOf(owner.race).scorchedEarth) continue;
       unit.hp -= 1;
-      if (unit.hp <= 0) player.units.delete(unitId);
+      if (unit.hp <= 0) {
+        player.units.delete(unitId);
+        player.usedWorkers = Math.max(0, player.usedWorkers - (unit.popCost || 0));
+      }
     }
   }
 }

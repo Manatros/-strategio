@@ -19,6 +19,7 @@
 //    or leak in the first place. The only personal-ish data kept is a
 //    display name the player chose themselves.
 import pg from "pg";
+import crypto from "crypto";
 const { Pool } = pg;
 
 const connectionString = process.env.DATABASE_URL;
@@ -56,13 +57,64 @@ function ensureSchema() {
         race TEXT,
         stats_json JSONB,
         owned_races_json JSONB NOT NULL DEFAULT '[]'::jsonb,
-        purchase_log_json JSONB NOT NULL DEFAULT '[]'::jsonb
+        purchase_log_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+        achievements_json JSONB NOT NULL DEFAULT '[]'::jsonb
       );
       CREATE INDEX IF NOT EXISTS idx_players_name ON players(name);
       CREATE INDEX IF NOT EXISTS idx_players_best_score ON players(best_score DESC);
+      ALTER TABLE players ADD COLUMN IF NOT EXISTS achievements_json JSONB NOT NULL DEFAULT '[]'::jsonb;
+      ALTER TABLE players ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT false;
+
+      CREATE TABLE IF NOT EXISTS accounts (
+        username_lower TEXT PRIMARY KEY,
+        username TEXT NOT NULL,
+        password_hash TEXT NOT NULL,
+        created_at BIGINT NOT NULL
+      );
     `);
   }
   return schemaReady;
+}
+
+/** scrypt with a random salt per password — Node's built-in, no extra dependency, well-regarded for this. */
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = crypto.scryptSync(password, salt, 64).toString("hex");
+  return `${salt}:${hash}`;
+}
+function verifyPassword(password, stored) {
+  const [salt, hash] = stored.split(":");
+  if (!salt || !hash) return false;
+  const check = crypto.scryptSync(password, salt, 64).toString("hex");
+  const a = Buffer.from(hash, "hex"), b = Buffer.from(check, "hex");
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+const USERNAME_RE = /^[a-zA-Z0-9_]{3,24}$/;
+
+export async function registerAccount(username, password) {
+  await ensureSchema();
+  if (typeof username !== "string" || !USERNAME_RE.test(username)) return { ok: false, error: "invalid_username" };
+  if (typeof password !== "string" || password.length < 8) return { ok: false, error: "password_too_short" };
+
+  const usernameLower = username.toLowerCase();
+  const { rows } = await pool.query("SELECT username_lower FROM accounts WHERE username_lower = $1", [usernameLower]);
+  if (rows.length) return { ok: false, error: "username_taken" };
+
+  const passwordHash = hashPassword(password);
+  await pool.query(
+    "INSERT INTO accounts (username_lower, username, password_hash, created_at) VALUES ($1, $2, $3, $4)",
+    [usernameLower, username, passwordHash, Date.now()]
+  );
+  return { ok: true, token: `account:${usernameLower}` };
+}
+
+export async function verifyAccountLogin(username, password) {
+  await ensureSchema();
+  if (typeof username !== "string" || typeof password !== "string") return { ok: false, error: "invalid_credentials" };
+  const { rows } = await pool.query("SELECT username_lower, password_hash FROM accounts WHERE username_lower = $1", [username.toLowerCase()]);
+  if (!rows.length || !verifyPassword(password, rows[0].password_hash)) return { ok: false, error: "invalid_credentials" };
+  return { ok: true, token: `account:${rows[0].username_lower}` };
 }
 
 function rowToRecord(row) {
@@ -72,6 +124,8 @@ function rowToRecord(row) {
     bestScore: row.best_score, gamesPlayed: row.games_played,
     race: row.race, stats: row.stats_json ?? null,
     ownedRaces: row.owned_races_json ?? [],
+    achievements: row.achievements_json ?? [],
+    isAdmin: !!row.is_admin,
   };
 }
 
@@ -157,6 +211,44 @@ export async function grantRaceEntitlement(token, race, source = "unknown") {
     [token, JSON.stringify([...owned]), JSON.stringify(purchaseLog)]
   );
   return true;
+}
+
+export async function getPlayerAchievements(token) {
+  await ensureSchema();
+  const { rows } = await pool.query("SELECT achievements_json FROM players WHERE token = $1", [token]);
+  return rows[0]?.achievements_json ?? [];
+}
+
+/** { id, unlockedAt }[] — idempotent: granting an already-held achievement is a safe no-op. */
+export async function grantAchievement(token, achievementId) {
+  await ensureSchema();
+  const { rows } = await pool.query("SELECT achievements_json FROM players WHERE token = $1", [token]);
+  const list = rows[0]?.achievements_json ?? [];
+  if (list.some(a => a.id === achievementId)) return false;
+  list.push({ id: achievementId, unlockedAt: Date.now() });
+
+  await pool.query(
+    `INSERT INTO players (token, name, achievements_json) VALUES ($1, 'Player', $2::jsonb)
+     ON CONFLICT (token) DO UPDATE SET achievements_json = $2::jsonb`,
+    [token, JSON.stringify(list)]
+  );
+  return true;
+}
+
+export async function getIsAdmin(token) {
+  await ensureSchema();
+  const { rows } = await pool.query("SELECT is_admin FROM players WHERE token = $1", [token]);
+  return !!rows[0]?.is_admin;
+}
+
+/** Grants or revokes admin status for a real identity — the actual (non-dev-override) mechanism. */
+export async function setAdmin(token, isAdmin) {
+  await ensureSchema();
+  await pool.query(
+    `INSERT INTO players (token, name, is_admin) VALUES ($1, 'Player', $2)
+     ON CONFLICT (token) DO UPDATE SET is_admin = $2`,
+    [token, !!isAdmin]
+  );
 }
 
 export async function getHighscores(limit = 50) {

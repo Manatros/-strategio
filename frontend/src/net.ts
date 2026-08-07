@@ -17,7 +17,8 @@ export type ProposalType = "trade" | "demand" | "open_borders";
 export type ResourceAmounts = Partial<Record<keyof Bank, number>>;
 
 export type ServerMsg =
-  | { type: "welcome"; playerId: string; roomId: string; seed: number; hexSize: number; visionRadius: number; spawn: Axial; color: number; race: string; resumed: boolean; hp: number; maxHp: number; stepCooldownMs: number; ownedRaces: string[] | null; tag: string }
+  | { type: "welcome"; playerId: string; roomId: string; seed: number; hexSize: number; visionRadius: number; spawn: Axial; color: number; race: string; resumed: boolean; hp: number; maxHp: number; stepCooldownMs: number; ownedRaces: string[] | null; tag: string; isAdmin: boolean }
+  | { type: "admin_debug"; roomId: string; tickCount: number; playerCount: number; buildingCount: number; claimCount: number; discoveredTiles: number; proposalCount: number; memoryMB: number }
   | { type: "bank"; bank: Bank; popCap: number; workers: number; hp: number; maxHp: number; score: number; research: string[]; storageCap: number; pendingResearch: { optionId: string; ticksRemaining: number; totalTicks: number } | null }
   | { type: "config"; buildCost: Record<string, Partial<Bank>>; unitCost: Record<string, { cost: Partial<Bank>; popCost: number; minUsedWorkers: number }>; demolishRefundFraction: number }
   | { type: "tiles_update"; tiles: RemoteTile[] }
@@ -30,7 +31,9 @@ export type ServerMsg =
   | { type: "relations_update"; withId: string; status: RelationStatus }
   | { type: "proposal_received"; id: string; proposalType: ProposalType; fromId: string; fromName: string; offer: ResourceAmounts | null; request: ResourceAmounts | null }
   | { type: "proposal_result"; id: string; proposalType: ProposalType; accepted: boolean; withId: string; reason?: string }
-  | { type: "research_unlocked"; optionId: string };
+  | { type: "research_unlocked"; optionId: string }
+  | { type: "achievement_unlocked"; id: string; name: string; description: string; category: string }
+  | { type: "game_over"; winnerId: string; winnerName: string; winnerRace: string; reason: string; youWon: boolean; finalScore: number; bonus: number };
 
 /**
  * Called once on page load. If we just landed here from the Steam login
@@ -74,7 +77,11 @@ export function getClientToken(): string {
 function resolveServerUrl(): string {
   const override = new URLSearchParams(window.location.search).get("server");
   if (override) return override;
-  if (window.location.port === "5173") return "ws://localhost:3000";
+  // Dev mode (Vite on 5173, backend on 3000) — use whatever host the page was actually loaded
+  // from, not a hardcoded "localhost". That literal only means "this device" from the browser's
+  // perspective; testing from another machine on the LAN via e.g. http://192.168.x.x:5173 needs
+  // the WebSocket to target that same address on port 3000, not the visiting device's own loopback.
+  if (window.location.port === "5173") return `ws://${window.location.hostname}:3000`;
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
   return `${proto}//${window.location.host}`;
 }
@@ -87,12 +94,30 @@ export type ConnectOptions = {
   mode: "new" | "auto";
 };
 
+export type DebugLogEntry = { dir: "in" | "out"; type: string; at: number; raw: unknown };
+
 export function connectWS(opts: ConnectOptions, url = resolveServerUrl()) {
   const ws = new WebSocket(url);
   const listeners = new Set<(msg: ServerMsg) => void>();
 
+  // Captures every message in both directions, for the admin debug HUD — entirely inert (just an
+  // array + a Set of subscribers) when nothing is listening, so this costs nothing for normal players.
+  const debugLog: DebugLogEntry[] = [];
+  const debugListeners = new Set<(entry: DebugLogEntry) => void>();
+  const MAX_DEBUG_LOG = 200;
+  function pushDebugLog(entry: DebugLogEntry) {
+    debugLog.push(entry);
+    if (debugLog.length > MAX_DEBUG_LOG) debugLog.shift();
+    debugListeners.forEach(fn => fn(entry));
+  }
+  const rawSend = ws.send.bind(ws);
+  const loggedSend = (data: string) => {
+    try { const parsed = JSON.parse(data); pushDebugLog({ dir: "out", type: parsed.type, at: Date.now(), raw: parsed }); } catch { /* ignore */ }
+    rawSend(data);
+  };
+
   ws.addEventListener("open", () => {
-    ws.send(JSON.stringify({
+    loggedSend(JSON.stringify({
       type: "handshake",
       name: opts.name,
       color: opts.color,
@@ -105,54 +130,66 @@ export function connectWS(opts: ConnectOptions, url = resolveServerUrl()) {
   ws.addEventListener("message", (ev) => {
     try {
       const msg = JSON.parse(String(ev.data)) as ServerMsg;
+      pushDebugLog({ dir: "in", type: msg.type, at: Date.now(), raw: msg });
       listeners.forEach(fn => fn(msg));
     } catch { /* ignore malformed frames */ }
   });
 
   return {
     onMessage(fn: (msg: ServerMsg) => void) { listeners.add(fn); return () => listeners.delete(fn); },
+    /** Admin debug HUD hook — fires for every message sent or received, doesn't affect normal gameplay. */
+    onDebugLog(fn: (entry: DebugLogEntry) => void) { debugListeners.add(fn); return () => debugListeners.delete(fn); },
+    getDebugLog() { return debugLog; },
     step(q: number, r: number) {
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "step", q, r }));
+      if (ws.readyState === WebSocket.OPEN) loggedSend(JSON.stringify({ type: "step", q, r }));
     },
     placeBuilding(kind: BuildingKind, q: number, r: number) {
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "place_building", kind, q, r }));
+      if (ws.readyState === WebSocket.OPEN) loggedSend(JSON.stringify({ type: "place_building", kind, q, r }));
     },
     /** Demolishes one of our own buildings — refunds part of its cost and frees the population it used. */
     demolishBuilding(q: number, r: number) {
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "demolish_building", q, r }));
+      if (ws.readyState === WebSocket.OPEN) loggedSend(JSON.stringify({ type: "demolish_building", q, r }));
     },
-    trainUnit(kind: "Scout" | "Soldier" | "Archer", q: number, r: number) {
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "train_unit", kind, q, r }));
+    trainUnit(kind: string, q: number, r: number) {
+      if (ws.readyState === WebSocket.OPEN) loggedSend(JSON.stringify({ type: "train_unit", kind, q, r }));
     },
     stepUnit(unitId: string, q: number, r: number) {
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "step_unit", unitId, q, r }));
+      if (ws.readyState === WebSocket.OPEN) loggedSend(JSON.stringify({ type: "step_unit", unitId, q, r }));
     },
     /** A Soldier attacks an adjacent tile (enemy building, unit, or player). */
     attack(unitId: string, q: number, r: number) {
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "attack", unitId, q, r }));
+      if (ws.readyState === WebSocket.OPEN) loggedSend(JSON.stringify({ type: "attack", unitId, q, r }));
     },
     /** Merges 3 same-kind, same-level units standing on (q,r) into one unit a level higher (max level 3). */
     mergeUnits(q: number, r: number) {
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "merge_units", q, r }));
+      if (ws.readyState === WebSocket.OPEN) loggedSend(JSON.stringify({ type: "merge_units", q, r }));
     },
     /** Unilateral and immediate — no consent needed from the target. */
     declareWar(toId: string) {
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "declare_war", toId }));
+      if (ws.readyState === WebSocket.OPEN) loggedSend(JSON.stringify({ type: "declare_war", toId }));
     },
     /** Trade, resource demands, and open-borders all need the other player to accept via respondProposal(). */
     propose(type: ProposalType, toId: string, offer: ResourceAmounts | null, request: ResourceAmounts | null) {
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "propose", proposalType: type, toId, offer, request }));
+      if (ws.readyState === WebSocket.OPEN) loggedSend(JSON.stringify({ type: "propose", proposalType: type, toId, offer, request }));
     },
     respondProposal(proposalId: string, accept: boolean) {
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "respond_proposal", proposalId, accept }));
+      if (ws.readyState === WebSocket.OPEN) loggedSend(JSON.stringify({ type: "respond_proposal", proposalId, accept }));
     },
     /** Unlocks a research option at one of our own Research buildings. */
     research(optionId: string) {
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "research", optionId }));
+      if (ws.readyState === WebSocket.OPEN) loggedSend(JSON.stringify({ type: "research", optionId }));
     },
     /** Guard mode: this unit automatically attacks any enemy that comes within its range. */
     setGuard(unitId: string, guard: boolean) {
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "set_guard", unitId, guard }));
+      if (ws.readyState === WebSocket.OPEN) loggedSend(JSON.stringify({ type: "set_guard", unitId, guard }));
+    },
+    /** Admin-only: server ignores this from non-admins. Bypasses the storage cap on purpose, for testing. */
+    adminCheatResources(amounts: ResourceAmounts) {
+      if (ws.readyState === WebSocket.OPEN) loggedSend(JSON.stringify({ type: "admin_cheat_resources", amounts }));
+    },
+    /** Admin-only: server ignores this from non-admins. Shows everything anyone in the room has discovered. */
+    adminToggleReveal(reveal: boolean) {
+      if (ws.readyState === WebSocket.OPEN) loggedSend(JSON.stringify({ type: "admin_toggle_reveal", reveal }));
     },
     close() { ws.close(); },
     socket: ws,

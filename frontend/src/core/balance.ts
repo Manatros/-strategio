@@ -12,4 +12,11 @@ import type { BuildingKind } from "../buildings/types";
 export const WORKER_EXEMPT = new Set<BuildingKind>(["TownHall", "House"]);
 
 /** How far each combat unit can attack — mirrors ATTACK_RANGE in balance.js (units only; ArcherTower fires on its own). */
-export const ATTACK_RANGE: Record<string, number> = { Soldier: 1, Archer: 3 };
+export const ATTACK_RANGE: Record<string, number> = { Soldier: 1, Archer: 3, Necromancer: 1, Brawler: 1 };
+
+/** Which building trains which unit — mirrors TRAINING_BUILDING in balance.js. Falls back to "Garrison" for anything unlisted. */
+export const TRAINING_BUILDING: Record<string, BuildingKind> = {
+  Scout: "Garrison", Soldier: "Garrison", Archer: "Garrison", Necromancer: "Garrison", Brawler: "Garrison",
+  Settler: "Outpost", Builder: "Outpost",
+  Priest: "Church",
+};

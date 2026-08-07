@@ -5,19 +5,22 @@ export type UnitHUDRefs = {
   root: HTMLElement;
   listEl: HTMLElement;
   abilitiesEl: HTMLElement;
-  trainScoutBtn: HTMLButtonElement;
-  trainSoldierBtn: HTMLButtonElement;
-  trainArcherBtn: HTMLButtonElement;
+  trainBtns: Record<string, HTMLButtonElement>; // keyed by unit kind — one button per trainable kind
   mergeBtn: HTMLButtonElement;
 };
+
+// The always-available roster. Race-specific extras (Necromancer for Undead, Brawler for Orc) are
+// appended by the caller at creation time, once the player's race is known — see GameScene.mount().
+const BASE_TRAINABLE_KINDS = ["Scout", "Soldier", "Archer", "Builder", "Priest"];
 
 export function createUnitHUD(
   mount: HTMLElement,
   onSelect: (id: string | null) => void,
-  onTrain: (kind: "Scout" | "Soldier" | "Archer") => void,
+  onTrain: (kind: string) => void,
   onMerge: () => void,
   onToggleAutoExplore: () => void,
-  onToggleGuard: () => void
+  onToggleGuard: () => void,
+  extraTrainableKinds: string[] = []
 ): UnitHUDRefs {
   const root = document.createElement("div");
   root.className = "hud";
@@ -61,35 +64,23 @@ export function createUnitHUD(
 
   const trainLabel = document.createElement("div");
   trainLabel.style.marginTop = "8px";
-  trainLabel.textContent = "Train at Garrison:";
+  trainLabel.textContent = "Train:";
   panel.appendChild(trainLabel);
 
   const trainRow = document.createElement("div");
-  trainRow.className = "row";
+  trainRow.className = "grid";
+  trainRow.style.gridTemplateColumns = "1fr 1fr";
   trainRow.style.gap = "6px";
 
-  const trainScoutBtn = document.createElement("button");
-  trainScoutBtn.className = "btn";
-  trainScoutBtn.textContent = "Scout";
-  trainScoutBtn.title = "Fish: 12, Pop: 1";
-  trainScoutBtn.onclick = () => onTrain("Scout");
-
-  const trainSoldierBtn = document.createElement("button");
-  trainSoldierBtn.className = "btn";
-  trainSoldierBtn.textContent = "Soldier";
-  trainSoldierBtn.title = "Wood: 10, Stone: 10, Pop: 1 (needs 2 population already in use)";
-  trainSoldierBtn.onclick = () => onTrain("Soldier");
-
-  trainRow.appendChild(trainScoutBtn);
-  trainRow.appendChild(trainSoldierBtn);
-
-  const trainArcherBtn = document.createElement("button");
-  trainArcherBtn.className = "btn";
-  trainArcherBtn.textContent = "Archer";
-  trainArcherBtn.title = "Wood: 12, Fish: 6, Pop: 1 (needs 2 population already in use) — 3x range, gated like Soldier";
-  trainArcherBtn.onclick = () => onTrain("Archer");
-  trainRow.appendChild(trainArcherBtn);
-
+  const trainBtns: Record<string, HTMLButtonElement> = {};
+  for (const kind of [...BASE_TRAINABLE_KINDS, ...extraTrainableKinds]) {
+    const btn = document.createElement("button");
+    btn.className = "btn";
+    btn.textContent = kind;
+    btn.onclick = () => onTrain(kind);
+    trainRow.appendChild(btn);
+    trainBtns[kind] = btn;
+  }
   panel.appendChild(trainRow);
 
   root.appendChild(panel);
@@ -102,21 +93,21 @@ export function createUnitHUD(
     if (id !== undefined) onSelect(id === "" ? null : id);
   });
 
-  return { root, listEl, abilitiesEl, trainScoutBtn, trainSoldierBtn, trainArcherBtn, mergeBtn };
+  return { root, listEl, abilitiesEl, trainBtns, mergeBtn };
 }
 
 function fmtCost(cost: Record<string, number>): string {
   return Object.entries(cost).map(([k, v]) => `${k}: ${v}`).join(", ");
 }
 
-/** Refreshes the train buttons' tooltips from the server-sent unit costs — same drift-proofing as BuildHUD's version. */
+/** Refreshes every train button's tooltip from the server-sent unit costs — same drift-proofing as BuildHUD's version. */
 export function updateTrainTooltips(ui: UnitHUDRefs, unitCost: Record<string, { cost: Record<string, number>; popCost: number; minUsedWorkers: number }>) {
-  const scout = unitCost.Scout;
-  if (scout) ui.trainScoutBtn.title = `${fmtCost(scout.cost)}, Pop: ${scout.popCost}${scout.minUsedWorkers ? ` (needs ${scout.minUsedWorkers} population already in use)` : ""}`;
-  const soldier = unitCost.Soldier;
-  if (soldier) ui.trainSoldierBtn.title = `${fmtCost(soldier.cost)}, Pop: ${soldier.popCost}${soldier.minUsedWorkers ? ` (needs ${soldier.minUsedWorkers} population already in use)` : ""}`;
-  const archer = unitCost.Archer;
-  if (archer) ui.trainArcherBtn.title = `${fmtCost(archer.cost)}, Pop: ${archer.popCost}${archer.minUsedWorkers ? ` (needs ${archer.minUsedWorkers} population already in use)` : ""} — 3x range`;
+  for (const kind of Object.keys(ui.trainBtns)) {
+    const info = unitCost[kind];
+    if (!info) continue;
+    const rangeNote = kind === "Archer" ? " — 3x range" : "";
+    ui.trainBtns[kind].title = `${fmtCost(info.cost)}, Pop: ${info.popCost}${info.minUsedWorkers ? ` (needs ${info.minUsedWorkers} population already in use)` : ""}${rangeNote}`;
+  }
 }
 
 export function refreshAbilities(
@@ -145,6 +136,14 @@ export function refreshAbilities(
     refs.abilitiesEl.innerHTML = `<small>Found Town: build a Town Hall while I'm next to it — I'll be used up</small>`;
     return;
   }
+  if (selectedKind === "Builder") {
+    refs.abilitiesEl.innerHTML = `<small>Can place buildings just like you can — select me, then use the build menu near me instead of near your character</small>`;
+    return;
+  }
+  if (selectedKind === "Priest") {
+    refs.abilitiesEl.innerHTML = `<small>Passive — no clicking needed. Standing on enemy scorched-earth territory cleanses it; standing on an enemy building you're at war with slowly captures it.</small>`;
+    return;
+  }
   if (selectedKind === "Scout" || selectedKind === "Necromancer") {
     const btn = document.createElement("button");
     btn.className = "btn";
@@ -168,7 +167,7 @@ export function refreshUnitHUD(
   ui: UnitHUDRefs,
   units: { id: string; kind: string; level: number }[],
   selectedId: string | null,
-  canTrainHere: boolean,
+  canTrainKind: (kind: string) => boolean,
   canMergeHere: boolean
 ) {
   ui.listEl.innerHTML = "";
@@ -189,12 +188,11 @@ export function refreshUnitHUD(
     ui.listEl.appendChild(b);
   }
 
-  ui.trainScoutBtn.disabled = !canTrainHere;
-  ui.trainScoutBtn.style.opacity = canTrainHere ? "1" : "0.5";
-  ui.trainSoldierBtn.disabled = !canTrainHere;
-  ui.trainSoldierBtn.style.opacity = canTrainHere ? "1" : "0.5";
-  ui.trainArcherBtn.disabled = !canTrainHere;
-  ui.trainArcherBtn.style.opacity = canTrainHere ? "1" : "0.5";
+  for (const kind of Object.keys(ui.trainBtns)) {
+    const ok = canTrainKind(kind);
+    ui.trainBtns[kind].disabled = !ok;
+    ui.trainBtns[kind].style.opacity = ok ? "1" : "0.5";
+  }
   ui.mergeBtn.disabled = !canMergeHere;
   ui.mergeBtn.style.opacity = canMergeHere ? "1" : "0.5";
 }

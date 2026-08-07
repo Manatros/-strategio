@@ -1,5 +1,4 @@
-import type { Scene } from "./SceneManager";
-import { SceneManager } from "./SceneManager";
+import { type Scene, SceneManager } from "./SceneManager";
 import { MenuScene } from "./MenuScene";
 import { fetchHighscores, type Highscore } from "../net";
 

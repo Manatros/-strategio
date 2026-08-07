@@ -11,6 +11,10 @@ export function canPlace(kind: BuildingKind, t: Tile | undefined, race?: string)
     case "House":       return t.kind === rd.houseTerrain;
     case "Garrison":    return t.kind === "Grass";
     case "ArcherTower": return t.kind === "Grass";
+    case "Research":    return t.kind === "Grass";
+    case "Warehouse":   return t.kind === "Grass";
+    case "Outpost":     return t.kind === "Grass";
+    case "Church":      return t.kind === "Grass";
     case "Lumberjack":  return t.kind === "Forest";
     case "Farm":        return t.kind === "Fields";
     case "Mine":        return t.kind === "Stone" || t.kind === "HighMountain";

@@ -12,6 +12,9 @@ import { canAfford, spend } from "../world/economy.js";
 import { canPlace, gatherTick } from "../world/buildings.js";
 import { RACES, raceOf, RACE_UNIT_OVERRIDES, resolveUnitDef } from "../world/races.js";
 import { recordGameEnd } from "../persist/store.js";
+import * as achievements from "./achievements.js";
+import { checkWinConditions } from "./winConditions.js";
+import { RACE_TROPHY_ID } from "../config/achievements.js";
 import {
   DEFAULT_TICK_RATE, HEX_SIZE, VISION_RADIUS, BUILDING_VISION_RADIUS, SCOUT_VISION_RADIUS,
   CLAIM_RADIUS, STARTING_BANK, BUILD_COST, CONSTRUCTION_TICKS, BUILDING_HEALTH, UNIT_DEFS,
@@ -23,6 +26,10 @@ import * as combat from "./combat.js";
 import * as raceEffects from "./raceEffects.js";
 import * as units from "./units.js";
 import * as research from "./research.js";
+import { advancePriestActions } from "./priestActions.js";
+
+const WIN_CHECK_TICKS = 10; // domination scans the whole tile cache, so check every 5s (at 2 ticks/sec) rather than every tick
+const ADMIN_DEBUG_TICKS = 4; // how often admin clients get a live server-diagnostics push (2s at the default tick rate)
 
 function colorForId(id) {
   let h = 0;
@@ -89,8 +96,8 @@ export class Room {
   getRelation(a, b) { return diplomacy.getRelation(this, a, b); }
   setRelation(a, b, status) { return diplomacy.setRelation(this, a, b, status); }
 
-  /** Fresh join: new spawn, new bank, new everything. `{ token, name, color, race, tag, ownedRaces }`. */
-  join(ws, { token, name = "Player", color, race, tag, ownedRaces } = {}) {
+  /** Fresh join: new spawn, new bank, new everything. `{ token, name, color, race, tag, ownedRaces, isAdmin }`. */
+  join(ws, { token, name = "Player", color, race, tag, ownedRaces, isAdmin = false } = {}) {
     const id = uid();
     this.clients.set(id, ws);
     const chosenRace = RACES.includes(race) ? race : "Human";
@@ -98,7 +105,7 @@ export class Room {
     const spawn = this.findSpawn(this.randomSpawnSeed(), rd.scoutCrossesHighMountain);
     this.usedSpawns.add(key(spawn.q, spawn.r));
     const player = {
-      id, name, tag: tag || "0000", token, race: chosenRace,
+      id, name, tag: tag || "0000", token, race: chosenRace, isAdmin: !!isAdmin,
       q: spawn.q, r: spawn.r,
       bank: { ...STARTING_BANK },
       color: assignColor(this, color),
@@ -116,16 +123,19 @@ export class Room {
       stats: { gathered: 0, built: 0, destroyed: 0, captured: 0, landClaimed: 0, kills: 0 },
       research: new Set(),
       pendingResearch: null,
+      revealMap: false,
       disconnectedAt: null,
     };
     this.players.set(id, player);
+    achievements.loadAchievements(player)
+      .catch((err) => log(`[room ${this.id}] loadAchievements failed for ${id}: ${err.message}`));
 
     // Some races start with units already in the field (e.g. Orc).
     for (const startKind of rd.startingUnits) {
       const spot = this.findAdjacentPassable(spawn, rd.scoutCrossesHighMountain) || spawn;
       const baseDef = resolveUnitDef(chosenRace, startKind, UNIT_DEFS, RACE_UNIT_OVERRIDES) || { hp: 10 };
       const unitDef = research.applyResearchHpBonus(player, startKind, baseDef);
-      const unit = { id: uid(), kind: startKind, level: 1, guard: false, q: spot.q, r: spot.r, lastStepAt: 0, lastActionAt: 0, hp: unitDef.hp, maxHp: unitDef.hp };
+      const unit = { id: uid(), kind: startKind, level: 1, guard: false, q: spot.q, r: spot.r, lastStepAt: 0, lastActionAt: 0, hp: unitDef.hp, maxHp: unitDef.hp, popCost: 0 }; // starting units are free -- never charged, so nothing to refund on death either
       player.units.set(unit.id, unit);
     }
 
@@ -136,7 +146,7 @@ export class Room {
       playerId: id, roomId: this.id, seed: this.seed, hexSize: this.hexSize,
       visionRadius: VISION_RADIUS, spawn: { q: player.q, r: player.r },
       color: player.color, race: chosenRace, resumed: false, hp: player.hp, maxHp: player.maxHp,
-      stepCooldownMs: this.stepCooldownMs, ownedRaces: ownedRaces ?? null, tag: player.tag,
+      stepCooldownMs: this.stepCooldownMs, ownedRaces: ownedRaces ?? null, tag: player.tag, isAdmin: player.isAdmin,
     });
     this._sendConfig(ws, player);
     this._sendBank(ws, player);
@@ -166,7 +176,7 @@ export class Room {
           playerId: player.id, roomId: this.id, seed: this.seed, hexSize: this.hexSize,
           visionRadius: VISION_RADIUS, spawn: { q: player.q, r: player.r },
           color: player.color, race: player.race, resumed: true, hp: player.hp, maxHp: player.maxHp,
-          stepCooldownMs: this.stepCooldownMs, tag: player.tag,
+          stepCooldownMs: this.stepCooldownMs, tag: player.tag, isAdmin: player.isAdmin,
         });
         this._sendConfig(ws, player);
         this._sendBank(ws, player);
@@ -271,6 +281,8 @@ export class Room {
       case "propose": diplomacy.handlePropose(this, player, msg); break;
       case "respond_proposal": diplomacy.handleRespondProposal(this, player, msg); break;
       case "research": research.handleResearch(this, player, msg); break;
+      case "admin_cheat_resources": this.handleAdminCheatResources(player, msg); break;
+      case "admin_toggle_reveal": this.handleAdminToggleReveal(player, msg); break;
       default: break;
     }
   }
@@ -309,11 +321,13 @@ export class Room {
     const q = Number(msg.q), r = Number(msg.r);
     if (!BUILD_COST[kind] || !Number.isFinite(q) || !Number.isFinite(r)) return;
 
-    // Every building except TownHall must be near the player; TownHall only needs a Settler nearby (see below) —
-    // that's what lets a Settler found a new town far from where the player currently is.
+    // Every building except TownHall must be near the player OR one of their own Builder units; TownHall
+    // only needs a Settler nearby (see below) — this is what lets a Settler found a new town far away,
+    // and a Builder construct things without the player character needing to be right there.
     if (kind !== "TownHall") {
-      const dist = hexDistance({ q: player.q, r: player.r }, { q, r });
-      if (dist > 1) return send(ws, "build_rejected", { reason: "too_far" });
+      const nearPlayer = hexDistance({ q: player.q, r: player.r }, { q, r }) <= 1;
+      const nearBuilder = [...player.units.values()].some(u => u.kind === "Builder" && hexDistance({ q: u.q, r: u.r }, { q, r }) <= 1);
+      if (!nearPlayer && !nearBuilder) return send(ws, "build_rejected", { reason: "too_far" });
     }
 
     const posKey = key(q, r);
@@ -406,7 +420,7 @@ export class Room {
    * their next connection with zero client-side changes needed.
    */
   _sendConfig(ws, player) {
-    const trainableKinds = ["Scout", "Soldier", "Archer"];
+    const trainableKinds = ["Scout", "Soldier", "Archer", "Settler", "Builder", "Priest"];
     const restricted = Object.entries(UNIT_RACE_RESTRICTION).filter(([, race]) => race === player.race).map(([kind]) => kind);
     const unitCost = {};
     for (const kind of [...trainableKinds, ...restricted]) {
@@ -414,6 +428,37 @@ export class Room {
       if (def) unitCost[kind] = { cost: def.cost, popCost: def.popCost, minUsedWorkers: def.minUsedWorkers || 0 };
     }
     send(ws, "config", { buildCost: BUILD_COST, unitCost, demolishRefundFraction: DEMOLISH_REFUND_FRACTION });
+  }
+
+  /**
+   * Admin-only: adds (or subtracts, for negative amounts) resources directly to a player's bank,
+   * for testing. Deliberately bypasses the normal storage cap — testing often needs to push past
+   * it on purpose — but still clamps to a sane range so a typo can't produce an absurd value.
+   */
+  handleAdminCheatResources(player, msg) {
+    if (!player.isAdmin) return; // silently ignore for non-admins -- no reason to even hint this exists
+    const ws = this.clients.get(player.id);
+    const amounts = msg.amounts;
+    if (!amounts || typeof amounts !== "object") return;
+
+    for (const k of ["Wood", "Stone", "Bread", "Fish", "Gold"]) {
+      const v = Number(amounts[k]);
+      if (!Number.isFinite(v) || v === 0) continue;
+      player.bank[k] = Math.max(0, Math.min(999999, (player.bank[k] || 0) + v));
+    }
+    this._sendBank(ws, player);
+  }
+
+  /** Admin-only: toggles seeing everything anyone in the room has ever discovered, ignoring normal vision entirely. */
+  handleAdminToggleReveal(player, msg) {
+    if (!player.isAdmin) return;
+    player.revealMap = !!msg.reveal;
+    // Visibility just changed dramatically in one direction or the other -- force a full resync
+    // rather than waiting for the normal diff logic to notice, in either direction.
+    player.knownTiles.clear();
+    player.knownBuildings.clear();
+    const ws = this.clients.get(player.id);
+    if (ws) this.sendWorldSlice(player, ws);
   }
 
   claimAround(center, ownerId, color, player, convertTo = null) {
@@ -479,6 +524,7 @@ export class Room {
         b.ticksRemaining = 0;
         b.constructed = true;
         b.hp = b.maxHp;
+        if (b.kind === "TownHall" || b.kind === "Warehouse") this._capCache.delete(b.ownerId); // its storage bonus just started counting
       } else {
         const progress = (b.constructionTicks - b.ticksRemaining) / b.constructionTicks;
         b.hp = Math.max(1, Math.round(1 + (b.maxHp - 1) * progress));
@@ -494,6 +540,43 @@ export class Room {
     }
   }
 
+  /**
+   * Ends the game for every player in the room at once (a win condition is a
+   * whole-room event, not a personal one — see winConditions.js). The winner
+   * gets their final score plus a 10% bonus and the race-specific trophy
+   * achievement; everyone's actual final score is persisted either way.
+   */
+  endGameByWin(winnerId, reason) {
+    const winner = this.players.get(winnerId);
+    if (!winner) return;
+
+    const bonus = Math.round(winner.score * 0.1);
+    const winnerFinalScore = Math.round(winner.score) + bonus;
+
+    const trophyId = RACE_TROPHY_ID[winner.race];
+    if (trophyId) achievements.grant(this, winner, trophyId);
+
+    for (const [id, player] of this.players) {
+      const isWinner = id === winnerId;
+      const finalScore = isWinner ? winnerFinalScore : Math.round(player.score);
+      recordGameEnd(player.token, finalScore, player.race, player.stats)
+        .catch((err) => log(`[room ${this.id}] recordGameEnd (win) failed for ${id}: ${err.message}`));
+
+      const ws = this.clients.get(id);
+      if (ws) {
+        send(ws, "game_over", {
+          winnerId, winnerName: winner.name, winnerRace: winner.race, reason,
+          youWon: isWinner, finalScore, bonus: isWinner ? bonus : 0,
+        });
+      }
+    }
+
+    log(`[room ${this.id}] game ended: ${winner.name} (${winner.race}) won by ${reason}, score ${winnerFinalScore}`);
+    this.clients.clear();
+    this.players.clear();
+    this.detach();
+  }
+
   tick(dtSec) {
     if (this.clients.size === 0) return;
     this.tickCount++;
@@ -505,6 +588,7 @@ export class Room {
     diplomacy.reapStaleProposals(this);
     units.advanceTraining(this);
     research.advanceResearch(this);
+    advancePriestActions(this);
 
     if (this.tickCount % ATTACK_COOLDOWN_TICKS === 0) { // reusing this cadence for "every few ticks" race effects too
       raceEffects.advanceScorchedEarth(this);
@@ -513,6 +597,15 @@ export class Room {
 
     if (this.tickCount % TILE_REGEN_CHECK_TICKS === 0) {
       this.advanceTileRegen(dtSec * TILE_REGEN_CHECK_TICKS);
+    }
+
+    for (const player of this.players.values()) {
+      achievements.checkStatAchievements(this, player);
+    }
+
+    if (this.tickCount % WIN_CHECK_TICKS === 0) {
+      const winResult = checkWinConditions(this);
+      if (winResult) { this.endGameByWin(winResult.winnerId, winResult.reason); return; }
     }
 
     for (const b of this.buildings.values()) {
@@ -531,22 +624,41 @@ export class Room {
       this.sendWorldSlice(player, ws);
       this._sendBank(ws, player);
     }
+
+    if (this.tickCount % ADMIN_DEBUG_TICKS === 0) {
+      for (const [id, ws] of this.clients) {
+        const player = this.players.get(id);
+        if (!player?.isAdmin) continue;
+        send(ws, "admin_debug", {
+          roomId: this.id, tickCount: this.tickCount,
+          playerCount: this.players.size, buildingCount: this.buildings.size,
+          claimCount: this.claims.size, discoveredTiles: this.tiles.cache.size,
+          proposalCount: this.proposals.size,
+          memoryMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+        });
+      }
+    }
   }
 
   sendWorldSlice(player, ws) {
     const center = { q: player.q, r: player.r };
     const visible = new Map();
-    for (const c of diskCoords(center, VISION_RADIUS)) visible.set(key(c.q, c.r), c);
-    for (const bp of player.ownedBuildings) {
-      for (const c of diskCoords(bp, BUILDING_VISION_RADIUS)) {
-        const k = key(c.q, c.r);
-        if (!visible.has(k)) visible.set(k, c);
+    if (player.revealMap) {
+      // Admin reveal: show every tile anyone in the room has ever discovered, not just this player's own vision.
+      for (const t of this.tiles.cache.values()) visible.set(key(t.q, t.r), { q: t.q, r: t.r });
+    } else {
+      for (const c of diskCoords(center, VISION_RADIUS)) visible.set(key(c.q, c.r), c);
+      for (const bp of player.ownedBuildings) {
+        for (const c of diskCoords(bp, BUILDING_VISION_RADIUS)) {
+          const k = key(c.q, c.r);
+          if (!visible.has(k)) visible.set(k, c);
+        }
       }
-    }
-    for (const u of player.units.values()) {
-      for (const c of diskCoords({ q: u.q, r: u.r }, SCOUT_VISION_RADIUS)) {
-        const k = key(c.q, c.r);
-        if (!visible.has(k)) visible.set(k, c);
+      for (const u of player.units.values()) {
+        for (const c of diskCoords({ q: u.q, r: u.r }, SCOUT_VISION_RADIUS)) {
+          const k = key(c.q, c.r);
+          if (!visible.has(k)) visible.set(k, c);
+        }
       }
     }
     const visibleKeys = new Set(visible.keys());
@@ -608,6 +720,10 @@ export class Room {
       players: this.players.size,
       buildings: this.buildings.size,
       seed: this.seed,
+      tickCount: this.tickCount,
+      claims: this.claims.size,
+      discoveredTiles: this.tiles.cache.size,
+      lastActive: this.lastActive,
     };
   }
 }

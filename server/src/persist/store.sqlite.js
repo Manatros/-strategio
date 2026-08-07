@@ -7,6 +7,7 @@ import Database from "better-sqlite3";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import crypto from "crypto";
 import { log } from "../utils/logger.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -30,13 +31,82 @@ db.exec(`
     race TEXT,
     stats_json TEXT,
     owned_races_json TEXT NOT NULL DEFAULT '[]',
-    purchase_log_json TEXT NOT NULL DEFAULT '[]'
+    purchase_log_json TEXT NOT NULL DEFAULT '[]',
+    achievements_json TEXT NOT NULL DEFAULT '[]',
+    is_admin INTEGER NOT NULL DEFAULT 0
   );
   CREATE INDEX IF NOT EXISTS idx_players_name ON players(name);
   CREATE INDEX IF NOT EXISTS idx_players_best_score ON players(best_score DESC);
+
+  CREATE TABLE IF NOT EXISTS accounts (
+    username TEXT PRIMARY KEY,
+    username_lower TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_username_lower ON accounts(username_lower);
 `);
 
+// Migration: add achievements_json to any players.db created before this column existed.
+const existingCols = db.prepare("PRAGMA table_info(players)").all().map(c => c.name);
+if (!existingCols.includes("achievements_json")) {
+  db.exec("ALTER TABLE players ADD COLUMN achievements_json TEXT NOT NULL DEFAULT '[]'");
+  log("[store:sqlite] migrated schema: added achievements_json column");
+}
+if (!existingCols.includes("is_admin")) {
+  db.exec("ALTER TABLE players ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0");
+  log("[store:sqlite] migrated schema: added is_admin column");
+}
+
 migrateFromJsonIfNeeded();
+
+/** scrypt with a random salt per password — Node's built-in, no extra dependency, well-regarded for this. */
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = crypto.scryptSync(password, salt, 64).toString("hex");
+  return `${salt}:${hash}`;
+}
+function verifyPassword(password, stored) {
+  const [salt, hash] = stored.split(":");
+  if (!salt || !hash) return false;
+  const check = crypto.scryptSync(password, salt, 64).toString("hex");
+  const a = Buffer.from(hash, "hex"), b = Buffer.from(check, "hex");
+  return a.length === b.length && crypto.timingSafeEqual(a, b); // constant-time, avoids leaking hash-match info via timing
+}
+
+const USERNAME_RE = /^[a-zA-Z0-9_]{3,24}$/;
+
+/**
+ * Creates a username/password account and returns the stable token it maps
+ * to going forward — "account:<username>", same pattern as Steam's
+ * "steam:<id64>". This is deliberately just another way to obtain a stable
+ * token; every other system (progress, achievements, entitlements) already
+ * only cares about the token string, so nothing else needed to change.
+ */
+export async function registerAccount(username, password) {
+  if (typeof username !== "string" || !USERNAME_RE.test(username)) {
+    return { ok: false, error: "invalid_username" }; // 3-24 chars, letters/numbers/underscore only
+  }
+  if (typeof password !== "string" || password.length < 8) {
+    return { ok: false, error: "password_too_short" };
+  }
+  const usernameLower = username.toLowerCase();
+  const existing = db.prepare("SELECT username FROM accounts WHERE username_lower = ?").get(usernameLower);
+  if (existing) return { ok: false, error: "username_taken" };
+
+  const passwordHash = hashPassword(password);
+  db.prepare("INSERT INTO accounts (username, username_lower, password_hash, created_at) VALUES (?, ?, ?, ?)")
+    .run(username, usernameLower, passwordHash, Date.now());
+
+  return { ok: true, token: `account:${usernameLower}` };
+}
+
+export async function verifyAccountLogin(username, password) {
+  if (typeof username !== "string" || typeof password !== "string") return { ok: false, error: "invalid_credentials" };
+  const row = db.prepare("SELECT username_lower, password_hash FROM accounts WHERE username_lower = ?").get(username.toLowerCase());
+  if (!row || !verifyPassword(password, row.password_hash)) return { ok: false, error: "invalid_credentials" };
+  return { ok: true, token: `account:${row.username_lower}` };
+}
 
 /** One-time import from the old players.json, if the DB is still empty and that file exists. */
 function migrateFromJsonIfNeeded() {
@@ -73,6 +143,8 @@ function rowToRecord(row) {
     bestScore: row.best_score, gamesPlayed: row.games_played,
     race: row.race, stats: row.stats_json ? JSON.parse(row.stats_json) : null,
     ownedRaces: JSON.parse(row.owned_races_json),
+    achievements: JSON.parse(row.achievements_json || "[]"),
+    isAdmin: !!row.is_admin,
   };
 }
 
@@ -151,6 +223,39 @@ export async function grantRaceEntitlement(token, race, source = "unknown") {
   `).run({ token, owned: JSON.stringify([...owned]), log: JSON.stringify(purchaseLog) });
 
   return true;
+}
+
+export async function getPlayerAchievements(token) {
+  const row = db.prepare("SELECT achievements_json FROM players WHERE token = ?").get(token);
+  return row ? JSON.parse(row.achievements_json || "[]") : [];
+}
+
+/** { id, unlockedAt }[] — idempotent: granting an already-held achievement is a safe no-op. */
+export async function grantAchievement(token, achievementId) {
+  const existing = db.prepare("SELECT achievements_json FROM players WHERE token = ?").get(token);
+  const list = existing ? JSON.parse(existing.achievements_json || "[]") : [];
+  if (list.some(a => a.id === achievementId)) return false;
+  list.push({ id: achievementId, unlockedAt: Date.now() });
+
+  db.prepare(`
+    INSERT INTO players (token, name, achievements_json) VALUES (@token, 'Player', @achievements)
+    ON CONFLICT(token) DO UPDATE SET achievements_json = @achievements
+  `).run({ token, achievements: JSON.stringify(list) });
+
+  return true;
+}
+
+export async function getIsAdmin(token) {
+  const row = db.prepare("SELECT is_admin FROM players WHERE token = ?").get(token);
+  return !!row?.is_admin;
+}
+
+/** Grants or revokes admin status for a real identity — the actual (non-dev-override) mechanism. */
+export async function setAdmin(token, isAdmin) {
+  db.prepare(`
+    INSERT INTO players (token, name, is_admin) VALUES (@token, 'Player', @isAdmin)
+    ON CONFLICT(token) DO UPDATE SET is_admin = @isAdmin
+  `).run({ token, isAdmin: isAdmin ? 1 : 0 });
 }
 
 export async function getHighscores(limit = 50) {

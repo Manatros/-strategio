@@ -14,7 +14,7 @@ export type UIRefs = {
   minimapEl: HTMLElement;
 };
 
-const ORDER: BuildingKind[] = ["TownHall","House","Lumberjack","Farm","Mine","FishingBoat","Bridge","Garrison","ArcherTower","Research","Warehouse"];
+const ORDER: BuildingKind[] = ["TownHall","House","Lumberjack","Farm","Mine","FishingBoat","Bridge","Garrison","ArcherTower","Research","Warehouse","Outpost","Church"];
 
 export function createBuildHUD(mount: HTMLElement, onPick:(b:BuildingKind)=>void): UIRefs {
   const root = document.createElement("div");

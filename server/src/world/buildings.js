@@ -1,5 +1,5 @@
 // Building/unit *logic* only — every tunable number lives in config/balance.js.
-import { BUILD_COST, GATHER_RATE, DWARF_MINE_ADJACENT_RATE } from "../config/balance.js";
+import { BUILD_COST, GATHER_RATE, DWARF_MINE_ADJACENT_RATE, RESEARCH_GOLD_RATE } from "../config/balance.js";
 
 export { BUILD_COST };
 
@@ -11,6 +11,10 @@ export function canPlace(kind, t, raceData) {
     case "House":       return t.kind === (raceData?.houseTerrain ?? "Grass");
     case "Garrison":    return t.kind === "Grass";
     case "ArcherTower": return t.kind === "Grass";
+    case "Research":    return t.kind === "Grass";
+    case "Warehouse":   return t.kind === "Grass";
+    case "Outpost":     return t.kind === "Grass";
+    case "Church":      return t.kind === "Grass";
     case "Lumberjack":  return t.kind === "Forest";
     case "Farm":        return t.kind === "Fields";
     case "Mine":        return t.kind === "Stone" || t.kind === "HighMountain";
@@ -21,18 +25,39 @@ export function canPlace(kind, t, raceData) {
 }
 
 /** Advance one building's resource gathering by dtSec, crediting `bank` (the owner's). */
-export function gatherTick(tiles, building, dtSec, bank, scoreRef, raceData = {}) {
+export function gatherTick(tiles, building, dtSec, bank, scoreRef, raceData = {}, storageCaps = null) {
   if (!building.constructed) return; // still being built — no output until it's finished
-  const t = tiles.getAt(building.q, building.r);
-  if (!t) return;
 
   const mult = (kind) => raceData.rateMultiplier?.[kind] ?? 1;
 
+  /** Adds `amount` of `kind` to the bank, clamped at that resource's storage cap (if any). */
+  const credit = (kind, amount) => {
+    if (amount <= 0) return;
+    const cap = storageCaps ? (storageCaps[kind] ?? Infinity) : Infinity;
+    const room = Math.max(0, cap - (bank[kind] ?? 0));
+    const got = Math.min(amount, room);
+    if (got <= 0) return;
+    bank[kind] = (bank[kind] ?? 0) + got;
+    if (scoreRef) scoreRef.value += got;
+    return got;
+  };
+
+  if (building.kind === "Research") {
+    credit("Gold", RESEARCH_GOLD_RATE * dtSec);
+    return;
+  }
+
+  const t = tiles.getAt(building.q, building.r);
+  if (!t) return;
+
   const take = (tile, kind, rate) => {
     if (!tile || tile.resLeft === undefined || tile.resLeft <= 0) return;
-    const got = Math.min(tile.resLeft, rate * dtSec);
+    const cap = storageCaps ? (storageCaps[kind] ?? Infinity) : Infinity;
+    const room = Math.max(0, cap - (bank[kind] ?? 0));
+    const got = Math.min(tile.resLeft, rate * dtSec, room);
+    if (got <= 0) return;
     tile.resLeft -= got;
-    bank[kind] += got;
+    bank[kind] = (bank[kind] ?? 0) + got;
     if (scoreRef) scoreRef.value += got;
   };
 
@@ -43,8 +68,7 @@ export function gatherTick(tiles, building, dtSec, bank, scoreRef, raceData = {}
       if (raceData.farmDepletesInstantly) {
         // Orc "Collect": empties the tile in one action for a flat 10 Bread, instead of gradual gathering.
         if (t.resLeft > 0) {
-          bank.Bread += 10;
-          if (scoreRef) scoreRef.value += 10;
+          credit("Bread", 10);
           t.resLeft = 0;
         }
       } else {
@@ -58,6 +82,7 @@ export function gatherTick(tiles, building, dtSec, bank, scoreRef, raceData = {}
     case "House": break;        // residential — no resource gathering, this is what grants population instead
     case "Garrison": break;     // no resource gathering — its job is training units
     case "ArcherTower": break;  // no resource gathering — see rooms/combat.js's advanceTowerDefense
+    case "Research": break;     // no resource gathering — unlocks research options instead, see rooms/research.js
     case "TownHall": {
       if (t.kind === "Forest") take(t, "Wood", GATHER_RATE.TownHallSelf);
       if (t.kind === "Fields") take(t, "Bread", GATHER_RATE.TownHallSelf);

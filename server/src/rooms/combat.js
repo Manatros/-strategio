@@ -49,6 +49,8 @@ export function resolveAttack(room, attackerPlayer, q, r, attackerUnitKind = nul
 
     // Orc pillage: a non-TownHall building at half hp or below is captured immediately, plus a resource bonus.
     if (building.kind !== "TownHall" && rd.canPillage && building.hp > 0 && building.hp <= building.maxHp / 2) {
+      const oldOwner = room.players.get(building.ownerId);
+      if (oldOwner && building.kind === "House") oldOwner.popCap = Math.max(0, oldOwner.popCap - raceOf(oldOwner.race).popPerHouse);
       building.ownerId = attackerPlayer.id;
       building.hp = building.maxHp;
       attackerPlayer.bank.Fish = (attackerPlayer.bank.Fish || 0) + 20;
@@ -58,11 +60,14 @@ export function resolveAttack(room, attackerPlayer, q, r, attackerUnitKind = nul
     }
 
     if (building.hp <= 0) {
+      const oldOwner = room.players.get(building.ownerId);
       if (building.kind === "TownHall") {
         room.buildings.delete(posKey);
         attackerPlayer.score += SCORE.destroyTownHall;
         attackerPlayer.stats.destroyed += 1;
+        if (oldOwner) oldOwner.popCap = Math.max(0, oldOwner.popCap - raceOf(oldOwner.race).popPerTownHall);
       } else {
+        if (oldOwner && building.kind === "House") oldOwner.popCap = Math.max(0, oldOwner.popCap - raceOf(oldOwner.race).popPerHouse);
         building.ownerId = attackerPlayer.id;
         building.hp = building.maxHp;
         attackerPlayer.score += SCORE.captureBuilding;
@@ -81,6 +86,7 @@ export function resolveAttack(room, attackerPlayer, q, r, attackerUnitKind = nul
         otherUnit.hp -= damage;
         if (otherUnit.hp <= 0) {
           other.units.delete(otherUnitId);
+          other.usedWorkers = Math.max(0, other.usedWorkers - (otherUnit.popCost || 0));
           // Necromancer: raise the fallen enemy as your own undead unit, same kind, at level 1, half hp.
           if (attackerUnitKind === "Necromancer") {
             const baseDef = resolveUnitDef(attackerPlayer.race, otherUnit.kind, UNIT_DEFS, RACE_UNIT_OVERRIDES) || { hp: 10 };
@@ -88,7 +94,7 @@ export function resolveAttack(room, attackerPlayer, q, r, attackerUnitKind = nul
             const raised = {
               id: uid(), kind: otherUnit.kind, level: 1, guard: false, q, r,
               lastStepAt: 0, lastActionAt: 0,
-              hp: Math.max(1, Math.round(def.hp * 0.5)), maxHp: def.hp,
+              hp: Math.max(1, Math.round(def.hp * 0.5)), maxHp: def.hp, popCost: 0,
             };
             attackerPlayer.units.set(raised.id, raised);
           }

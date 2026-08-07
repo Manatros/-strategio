@@ -20,6 +20,12 @@ export const {
   recordGameEnd,
   getOwnedRaces,
   grantRaceEntitlement,
+  getPlayerAchievements,
+  grantAchievement,
+  registerAccount,
+  verifyAccountLogin,
+  getIsAdmin,
+  setAdmin,
   getHighscores,
   flush,
 } = backend;

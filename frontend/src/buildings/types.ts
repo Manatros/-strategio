@@ -1,5 +1,5 @@
 // src/buildings/types.ts
-export type BuildingKind = "TownHall" | "Lumberjack" | "Farm" | "Mine" | "FishingBoat" | "Bridge" | "House" | "Garrison" | "ArcherTower" | "Warehouse" | "Research";
+export type BuildingKind = "TownHall" | "Lumberjack" | "Farm" | "Mine" | "FishingBoat" | "Bridge" | "House" | "Garrison" | "ArcherTower" | "Research" | "Warehouse" | "Outpost" | "Church";
 
 export type Building = {
   kind: BuildingKind;
