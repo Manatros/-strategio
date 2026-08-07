@@ -1,22 +1,114 @@
 :root {
-  --bg: #0f1116;
-  --fg: #e6e6e6;
-  --accent: #3a86ff;
+  --bg: #14100c;
+  --fg: #ead9b8;
+  --accent: #c9a227;
+  --accent-bright: #f0c85a;
+  --panel-bg: #1c1712;
+  --panel-border: #5a4522;
+  --panel-border-bright: #9c7b2e;
 }
 html,body,#app{height:100%;margin:0;}
-body{background:var(--bg);color:var(--fg);font-family:system-ui,Segoe UI,Roboto,Inter,sans-serif;}
+body{
+  background:
+    radial-gradient(1400px 700px at 50% -10%, #241c12 0%, transparent 60%),
+    var(--bg);
+  color:var(--fg);
+  font-family:"Segoe UI",Roboto,Inter,system-ui,sans-serif;
+}
+h1, .menu h1, .hud strong, strong { font-family:"Cinzel", "Segoe UI", serif; letter-spacing:.5px; }
+
 .hud{
   position:fixed;pointer-events:none;inset:0;display:flex;justify-content:space-between;align-items:flex-start;padding:10px;
 }
-.hud .panel{pointer-events:auto;background:rgba(0,0,0,.35);backdrop-filter: blur(6px);border:1px solid #222;border-radius:12px;padding:10px;min-width:180px}
+
+/* Carved-bronze panel: layered borders + inset highlight to read as "metal/wood frame" rather than a flat rectangle. */
+.hud .panel{
+  pointer-events:auto;
+  position:relative;
+  background:
+    linear-gradient(180deg, rgba(255,220,140,.05), rgba(0,0,0,.15) 40%),
+    var(--panel-bg);
+  border:1px solid var(--panel-border);
+  border-radius:4px;
+  padding:10px;
+  min-width:180px;
+  box-shadow:
+    inset 0 0 0 1px rgba(240,200,90,.12),
+    inset 0 1px 0 rgba(255,235,180,.08),
+    0 6px 18px rgba(0,0,0,.5);
+}
+/* Small corner accents, evoking a carved/ornamented frame without needing image assets. */
+.hud .panel::before, .hud .panel::after{
+  content:"";
+  position:absolute;
+  width:10px; height:10px;
+  border:1px solid var(--panel-border-bright);
+  opacity:.7;
+  pointer-events:none;
+}
+.hud .panel::before{ top:-1px; left:-1px; border-right:none; border-bottom:none; }
+.hud .panel::after{ bottom:-1px; right:-1px; border-left:none; border-top:none; }
+
+.draggable-panel{z-index:50}
+.draggable-panel .drag-handle{cursor:grab;touch-action:none}
+.draggable-panel.dragging{cursor:grabbing;opacity:.92;z-index:100;user-select:none}
 .hud .row{display:flex;gap:8px;align-items:center}
-.btn{pointer-events:auto;cursor:pointer;padding:6px 10px;border-radius:8px;border:1px solid #333;background:#1a1d25;color:var(--fg)}
-.btn:hover{background:#222a36}
-.minimap{width:160px;height:120px;background:#0b0c10;border:1px solid #222;border-radius:6px}
-.menu-root{position:fixed;inset:0;display:grid;place-items:center;background:radial-gradient(1200px 600px at 50% 20%, #172033, transparent 70%)}
-.menu{display:flex;flex-direction:column;gap:12px;min-width:320px;background:rgba(0,0,0,.35);border:1px solid #222;border-radius:16px;padding:18px}
-.menu h1{margin:0 0 6px 0;font-weight:700;letter-spacing:.5px}
-.menu small{opacity:.7}
+
+.btn{
+  pointer-events:auto;cursor:pointer;
+  padding:6px 11px;
+  border-radius:3px;
+  border:1px solid var(--panel-border);
+  background:linear-gradient(180deg, #2a2116, #1a140e);
+  color:var(--fg);
+  font-family:inherit;
+  transition:border-color .12s, box-shadow .12s, background .12s;
+}
+.btn:hover:not(:disabled){
+  background:linear-gradient(180deg, #362a1a, #221a10);
+  border-color:var(--accent);
+  box-shadow:0 0 0 1px rgba(201,162,39,.35);
+}
+.btn:disabled{ opacity:.45; cursor:default; }
+.btn:active:not(:disabled){ transform:translateY(1px); }
+
+.minimap{
+  width:160px;height:120px;
+  background:#0b0906;
+  border:1px solid var(--panel-border);
+  border-radius:3px;
+  box-shadow:inset 0 0 0 1px rgba(240,200,90,.1);
+}
+
+.toast-card{ border-left:3px solid var(--accent-bright) !important; }
+
+.menu-root{
+  position:fixed;inset:0;display:grid;place-items:center;
+  background:
+    radial-gradient(1200px 600px at 50% 15%, #2a2013, transparent 65%),
+    var(--bg);
+}
+.menu{
+  display:flex;flex-direction:column;gap:12px;min-width:340px;
+  background:
+    linear-gradient(180deg, rgba(255,220,140,.05), rgba(0,0,0,.2) 40%),
+    var(--panel-bg);
+  border:1px solid var(--panel-border);
+  border-radius:6px;
+  padding:22px;
+  box-shadow:
+    inset 0 0 0 1px rgba(240,200,90,.12),
+    inset 0 1px 0 rgba(255,235,180,.08),
+    0 12px 40px rgba(0,0,0,.6);
+}
+.menu h1{
+  margin:0 0 2px 0;
+  font-weight:700;
+  font-size:1.9rem;
+  color:var(--accent-bright);
+  text-shadow:0 2px 8px rgba(0,0,0,.6);
+}
+.menu small{opacity:.65}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
 .color-pick{display:grid;grid-template-columns:repeat(8,20px);gap:6px}
-.color-swatch{width:20px;height:20px;border-radius:50%;border:1px solid #222;cursor:pointer}
+.color-swatch{width:20px;height:20px;border-radius:50%;border:1px solid var(--panel-border);cursor:pointer}
