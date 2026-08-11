@@ -8,7 +8,7 @@ import { log } from "../utils/logger.js";
 import { send, safeJSON } from "../net/wire.js";
 import { TileStore } from "../world/tileStore.js";
 import { key, hexDistance, diskCoords, canEnterTerrain } from "../world/hex.js";
-import { canAfford, spend } from "../world/economy.js";
+import { canAfford } from "../world/economy.js";
 import { canPlace, gatherTick } from "../world/buildings.js";
 import { RACES, raceOf, RACE_UNIT_OVERRIDES, resolveUnitDef } from "../world/races.js";
 import { recordGameEnd } from "../persist/store.js";
@@ -16,20 +16,29 @@ import * as achievements from "./achievements.js";
 import { checkWinConditions } from "./winConditions.js";
 import { RACE_TROPHY_ID } from "../config/achievements.js";
 import {
-  DEFAULT_TICK_RATE, HEX_SIZE, VISION_RADIUS, BUILDING_VISION_RADIUS, SCOUT_VISION_RADIUS,
+  DEFAULT_TICK_RATE, HEX_SIZE, VISION_RADIUS, BUILDING_VISION_RADIUS, SCOUT_VISION_RADIUS, UNIT_VISION_BONUS,
   CLAIM_RADIUS, STARTING_BANK, BUILD_COST, CONSTRUCTION_TICKS, BUILDING_HEALTH, UNIT_DEFS,
   WORKER_EXEMPT, ATTACK_COOLDOWN_TICKS, SCORE, PLAYER_MAX_HP, DISCONNECT_GRACE_MS, PLAYER_COLORS, DEMOLISH_REFUND_FRACTION,
   BASE_STORAGE_CAP, TOWNHALL_STORAGE_BONUS, WAREHOUSE_STORAGE_BONUS, UNIT_RACE_RESTRICTION, TILE_REGEN_RATE, TILE_REGEN_CHECK_TICKS,
+  ROAD_CLAIM_RADIUS, ROAD_UPGRADE_COST, ROAD_SPEED_TICKS, GATHERING_BUILDING_CAP, BUILDING_UNLOCK_RESEARCH, DWARF_VAULT_GOLD_BONUS, HERO_ITEM_SLOTS,
 } from "../config/balance.js";
 import * as diplomacy from "./diplomacy.js";
 import * as combat from "./combat.js";
 import * as raceEffects from "./raceEffects.js";
 import * as units from "./units.js";
+import * as heroItems from "./heroItems.js";
 import * as research from "./research.js";
 import { advancePriestActions } from "./priestActions.js";
+import { advanceBuilderRepair } from "./builderActions.js";
+import { advanceMonasteryHealing } from "./monasteryActions.js";
+import { spawnCivilians, handleAssignCivilian, advanceCivilianTravel, advanceCivilianDelivery, advanceCivilianReturnHome, advanceCivilianRespawns, advanceWarehouseRoving, releaseCiviliansFrom, handleUpgradeHouse, handleCollectResources, handleUpgradeGatheringBuilding, handleUpgradeWarehouseTier, handleConvertTile, tryAutoAssignWorker, handleAssignNearestWorker, handleUnassignWorker, tryAutoConnectRoad } from "./civilians.js";
+import { ensureBotsFilled } from "./bots.js";
+import { advanceBotAI } from "./botAI.js";
+import { spendResources, creditResources, initStorageInventory, humanStorageCap, storageCapFor, recomputeHumanBank, advanceHumanGathering, advanceHouseTax } from "./humanEconomy.js";
 
 const WIN_CHECK_TICKS = 10; // domination scans the whole tile cache, so check every 5s (at 2 ticks/sec) rather than every tick
 const ADMIN_DEBUG_TICKS = 4; // how often admin clients get a live server-diagnostics push (2s at the default tick rate)
+const BOT_BACKFILL_CHECK_TICKS = 20; // how often to check whether a freed slot (e.g. a real player's disconnect grace period expired) needs a new bot
 
 function colorForId(id) {
   let h = 0;
@@ -108,6 +117,7 @@ export class Room {
       id, name, tag: tag || "0000", token, race: chosenRace, isAdmin: !!isAdmin,
       q: spawn.q, r: spawn.r,
       bank: { ...STARTING_BANK },
+      orphanedBank: { ...STARTING_BANK }, // Human only (see rooms/humanEconomy.js) — inert for every other race
       color: assignColor(this, color),
       popCap: 0,
       usedWorkers: 0,
@@ -119,11 +129,14 @@ export class Room {
       knownBuildings: new Set(),
       hp: PLAYER_MAX_HP,
       maxHp: PLAYER_MAX_HP,
+      heroItems: new Array(HERO_ITEM_SLOTS).fill(null), // this player's own hero-unit equipment — see heroItems.js
       score: 0,
       stats: { gathered: 0, built: 0, destroyed: 0, captured: 0, landClaimed: 0, kills: 0 },
       research: new Set(),
+      buildingUnlocks: new Set(), // separate from research above — see BUILDING_UNLOCK_RESEARCH in balance.js
       pendingResearch: null,
       revealMap: false,
+      pendingCivilianRespawns: [], // Human only — [{ homeBuildingId, readyAt }], see civilians.js's advanceCivilianRespawns
       disconnectedAt: null,
     };
     this.players.set(id, player);
@@ -168,7 +181,11 @@ export class Room {
         // knownTiles/knownBuildings still reflect the OLD session. Without clearing these, the
         // diff-based sendWorldSlice() thinks "nothing changed" and never resends anything the
         // player already "knew" before disconnecting — leaving the new client blind to its own
-        // units/buildings/terrain. This was the resume bug.
+        // units/buildings/terrain. This was the resume bug. Snapshot what they knew BEFORE
+        // clearing, though — sendWorldSlice only covers currently-visible tiles, so anything they'd
+        // explored before that's now outside their vision radius needs a separate resend below, or
+        // it's silently lost (their exploration/claims history disappearing on resume).
+        const previouslyKnownTileKeys = [...player.knownTiles.keys()];
         player.knownTiles.clear();
         player.knownBuildings.clear();
 
@@ -181,6 +198,23 @@ export class Room {
         this._sendConfig(ws, player);
         this._sendBank(ws, player);
         this.sendWorldSlice(player, ws); // don't make them wait for the next tick to see anything
+
+        // Resend whatever they'd explored before that ISN'T already covered by the currently-visible
+        // slice just sent above — the previously-out-of-vision remainder of their exploration history.
+        const alreadyCovered = new Set(player.knownTiles.keys()); // sendWorldSlice just populated this with the currently-visible set
+        const staleTiles = [];
+        for (const k of previouslyKnownTileKeys) {
+          if (alreadyCovered.has(k)) continue;
+          const [tq, tr] = k.split(",").map(Number);
+          const t = this.tiles.getAt(tq, tr);
+          const claim = this.claims.get(k);
+          staleTiles.push(claim
+            ? { ...t, claimedBy: { id: claim.ownerId, color: claim.color, name: this.players.get(claim.ownerId)?.name ?? "", race: this.players.get(claim.ownerId)?.race ?? "Human" } }
+            : t);
+          player.knownTiles.set(k, { kind: t.kind, resLeft: t.resLeft, claimedBy: claim?.ownerId, blocked: !!t.blocked });
+        }
+        if (staleTiles.length) send(ws, "tiles_update", { tiles: staleTiles });
+
         log(`[room ${this.id}] resume: ${player.id} (${player.name})`);
         return player.id;
       }
@@ -200,6 +234,8 @@ export class Room {
       hp: player.hp, maxHp: player.maxHp, score: player.score,
       research: [...player.research], storageCap: this.storageCap(player).Wood,
       pendingResearch: player.pendingResearch,
+      buildingUnlocks: [...(player.buildingUnlocks ?? [])],
+      heroItems: player.heroItems ?? [],
     });
   }
 
@@ -216,22 +252,115 @@ export class Room {
   reapDisconnected(now = Date.now()) {
     for (const [id, player] of this.players) {
       if (player.disconnectedAt && now - player.disconnectedAt > DISCONNECT_GRACE_MS) {
-        this.usedSpawns.delete(player.spawnKey);
-        this.players.delete(id);
+        this._endAbandonedDisconnect(player, "grace_period_expired");
       }
     }
   }
 
-  /** Ends a player's game permanently: persists their score+stats, tells their client, removes them. */
-  killPlayer(player, reason = "died") {
-    recordGameEnd(player.token, Math.round(player.score), player.race, player.stats)
+  /** Shared "this player's game is over, persist their score" logic — used by every path a
+   *  player's game can end through, so none of them can silently skip saving it. */
+  _persistGameEnd(player, reason) {
+    recordGameEnd(player.token, Math.round(player.score), player.race, player.stats, !!player.isBot)
       .catch((err) => log(`[room ${this.id}] recordGameEnd failed for ${player.id}: ${err.message}`));
     const ws = this.clients.get(player.id);
     if (ws) send(ws, "you_died", { finalScore: Math.round(player.score), reason });
     this.clients.delete(player.id);
+  }
+
+  /** Grace-period expiry (a disconnected player who never came back) — they already had their full
+   *  wait as a disconnected-but-intact player, so this is a full, immediate removal: buildings and
+   *  claims are cleaned up right away rather than starting a second wait on top of the first. */
+  _endAbandonedDisconnect(player, reason) {
+    this._persistGameEnd(player, reason);
+    this._removePlayerAndCleanup(player);
+  }
+
+  /** Death (combat, TownHall elimination) or voluntary surrender — genuinely starts the decay
+   *  window now (see advanceAbandonedDecay): buildings and units drain HP over DISCONNECT_GRACE_MS
+   *  instead of lingering forever ownerless or vanishing instantly, so other players still have a
+   *  window to attack and get credit for finishing them off rather than the game just erasing
+   *  everything for free. */
+  _endPlayerGame(player, reason) {
+    this._persistGameEnd(player, reason);
+    this.usedSpawns.delete(player.spawnKey);
+    player.abandoned = true;
+    player.abandonedAt = Date.now();
+    player.disconnectedAt = null; // no longer meaningful once abandoned — decay has its own timer
+
+    // Snapshot each building/unit's decay rate based on its hp right now, so it drains toward
+    // exactly 0 by the deadline at a constant rate — independent of whatever damage (or none) it
+    // takes from other players along the way, rather than a percentage-based decay that would
+    // asymptotically approach 0 without ever quite reaching it.
+    const graceSec = DISCONNECT_GRACE_MS / 1000;
+    for (const b of this.buildings.values()) {
+      if (b.ownerId === player.id) b.decayHpPerSec = b.hp / graceSec;
+    }
+    for (const u of player.units.values()) {
+      u.decayHpPerSec = u.hp / graceSec;
+    }
+
+    this.broadcast("player_leave", { id: player.id, reason });
+    ensureBotsFilled(this, this.cfg.targetLobbySize);
+  }
+
+  /** Fully removes a player and everything they own — buildings, claims, units — right now. Used
+   *  once decay finishes (see advanceAbandonedDecay) and for grace-period expiry. */
+  _removePlayerAndCleanup(player) {
+    for (const [k, b] of [...this.buildings]) {
+      if (b.ownerId !== player.id) continue;
+      this.buildings.delete(k);
+    }
+    for (const k of [...this.claims.keys()]) {
+      if (this.claims.get(k).ownerId === player.id) this.claims.delete(k);
+    }
     this.usedSpawns.delete(player.spawnKey);
     this.players.delete(player.id);
-    this.broadcast("player_leave", { id: player.id, reason });
+  }
+
+  /** Advances decay for every abandoned player's buildings and units — drains hp at each one's
+   *  snapshotted constant rate (see _endPlayerGame), destroying it (and releasing just its own
+   *  claim radius, same as normal combat destruction) once hp hits 0. Other players can still
+   *  attack and finish these off for the usual combat credit during the window — decay doesn't
+   *  prevent that, it's just what happens if nobody bothers. Once the full grace window has
+   *  elapsed, whatever's left gets fully cleaned up regardless. */
+  advanceAbandonedDecay(dtSec) {
+    const now = Date.now();
+    for (const player of [...this.players.values()]) {
+      if (!player.abandoned) continue;
+      if (now - player.abandonedAt > DISCONNECT_GRACE_MS) {
+        this._removePlayerAndCleanup(player);
+        continue;
+      }
+      for (const [k, b] of [...this.buildings]) {
+        if (b.ownerId !== player.id) continue;
+        b.hp -= (b.decayHpPerSec || 0) * dtSec;
+        if (b.hp <= 0) {
+          this.releaseClaimsAround(b);
+          this.buildings.delete(k);
+        }
+      }
+      for (const [uid, u] of [...player.units]) {
+        u.hp -= (u.decayHpPerSec || 0) * dtSec;
+        if (u.hp <= 0) player.units.delete(uid);
+      }
+    }
+  }
+
+  /** Ends a player's game permanently: persists their score+stats, tells their client, removes them.
+   *  No-ops if they're already abandoned (surrendered/died earlier) — their game already ended once;
+   *  a further "kill" during their decay window (their last building falling, etc.) isn't a second
+   *  game-ending event. */
+  killPlayer(player, reason = "died") {
+    if (player.abandoned) return;
+    this._endPlayerGame(player, reason);
+  }
+
+  /** A player voluntarily ending their own current game — same accounting as dying (score saved,
+   *  removed, bots backfilled), just player-initiated instead of combat-initiated. Also reused for
+   *  the automatic "started a new game elsewhere, this old disconnected instance is abandoned" case. */
+  handleSurrender(player, reason = "surrendered") {
+    if (player.abandoned) return;
+    this._endPlayerGame(player, reason);
   }
 
   randomSpawnSeed() {
@@ -241,16 +370,54 @@ export class Room {
     return { q: Math.round(Math.cos(angle) * dist), r: Math.round(Math.sin(angle) * dist) };
   }
 
+  /** Is every tile within `radius` of `c` free of any claimed territory? Used so a new spawn always
+   *  has genuine room to move and claim land of its own, rather than landing inside or right next to
+   *  someone else's territory (where they might not even be able to step off their own spawn tile). */
+  _farEnoughFromClaims(c, radius) {
+    if (this.claims.size === 0) return true; // nothing claimed yet anywhere -- trivially fine
+    for (const nc of diskCoords(c, radius)) {
+      if (this.claims.has(key(nc.q, nc.r))) return false;
+    }
+    return true;
+  }
+
   findSpawn(start, allowHighMountain = false) {
-    const MAX_RADIUS = 50;
-    const free = (c) => canEnterTerrain(this.tiles.getAt(c.q, c.r), allowHighMountain) && !this.usedSpawns.has(key(c.q, c.r));
+    const MAX_RADIUS = 80; // wider search than before -- the territory-distance requirement needs more room
+    const MIN_DISTANCE_FROM_CLAIM = 10;
+    const free = (c) =>
+      canEnterTerrain(this.tiles.getAt(c.q, c.r), allowHighMountain) &&
+      !this.usedSpawns.has(key(c.q, c.r)) &&
+      this._farEnoughFromClaims(c, MIN_DISTANCE_FROM_CLAIM);
+
     if (free(start)) return start;
     for (let radius = 1; radius < MAX_RADIUS; radius++) {
       for (const c of diskCoords(start, radius)) {
         if (free(c)) return c;
       }
     }
+
+    // Every candidate within MAX_RADIUS was too close to someone's territory (a very crowded/claimed
+    // map) — fall back to the old terrain-only requirement rather than fail to spawn the player at all.
+    const freeIgnoringClaims = (c) => canEnterTerrain(this.tiles.getAt(c.q, c.r), allowHighMountain) && !this.usedSpawns.has(key(c.q, c.r));
+    if (freeIgnoringClaims(start)) return start;
+    for (let radius = 1; radius < MAX_RADIUS; radius++) {
+      for (const c of diskCoords(start, radius)) {
+        if (freeIgnoringClaims(c)) return c;
+      }
+    }
     return start;
+  }
+
+  /** Whether `kind` is actually placeable right now for this player — true immediately for
+   *  anything not listed in BUILDING_UNLOCK_RESEARCH for their race (the vast majority of
+   *  buildings, and every non-Human race's whole roster), otherwise only once the specific unlock
+   *  research covering it has been purchased at whichever building offers it. */
+  isBuildingUnlocked(player, kind) {
+    const raceOptions = BUILDING_UNLOCK_RESEARCH[player.race];
+    if (!raceOptions) return true;
+    const relevant = Object.values(raceOptions).flat().find((o) => o.building === kind);
+    if (!relevant) return true; // not gated at all
+    return !!player.buildingUnlocks?.has(relevant.id);
   }
 
   findAdjacentPassable(center, allowHighMountain = false) {
@@ -273,16 +440,31 @@ export class Room {
       case "place_building": this.handlePlaceBuilding(player, msg); break;
       case "demolish_building": this.handleDemolishBuilding(player, msg); break;
       case "train_unit": units.handleTrainUnit(this, player, msg); break;
+      case "cancel_training": units.handleCancelTraining(this, player, msg); break;
       case "step_unit": units.handleStepUnit(this, player, msg); break;
       case "merge_units": units.handleMergeUnits(this, player, msg); break;
       case "set_guard": units.handleSetGuard(this, player, msg); break;
+      case "surrender": this.handleSurrender(player); break;
+      case "equip_hero_item": heroItems.handleEquipHeroItem(this, player, msg); break;
+      case "unequip_hero_item": heroItems.handleUnequipHeroItem(this, player, msg); break;
+      case "forage": units.handleForage(this, player, msg); break;
       case "attack": combat.handleAttack(this, player, msg); break;
       case "declare_war": diplomacy.handleDeclareWar(this, player, msg); break;
       case "propose": diplomacy.handlePropose(this, player, msg); break;
       case "respond_proposal": diplomacy.handleRespondProposal(this, player, msg); break;
       case "research": research.handleResearch(this, player, msg); break;
+      case "research_building": research.handleResearchBuilding(this, player, msg); break;
       case "admin_cheat_resources": this.handleAdminCheatResources(player, msg); break;
       case "admin_toggle_reveal": this.handleAdminToggleReveal(player, msg); break;
+      case "upgrade_road": this.handleUpgradeRoad(player, msg); break;
+      case "assign_civilian": handleAssignCivilian(this, player, msg); break;
+      case "assign_nearest_worker": handleAssignNearestWorker(this, player, msg); break;
+      case "unassign_worker": handleUnassignWorker(this, player, msg); break;
+      case "upgrade_house": handleUpgradeHouse(this, player, msg); break;
+      case "collect_resources": handleCollectResources(this, player, msg); break;
+      case "upgrade_gathering_building": handleUpgradeGatheringBuilding(this, player, msg); break;
+      case "upgrade_warehouse": handleUpgradeWarehouseTier(this, player, msg); break;
+      case "convert_tile": handleConvertTile(this, player, msg); break;
       default: break;
     }
   }
@@ -292,12 +474,12 @@ export class Room {
     const q = Number(msg.q), r = Number(msg.r);
     if (!Number.isFinite(q) || !Number.isFinite(r)) return;
 
-    const now = Date.now();
-    if (now - player.lastStepAt < this.stepCooldownMs) {
-      return send(ws, "step_rejected", { q, r, reason: "too_soon" });
-    }
     if (hexDistance({ q: player.q, r: player.r }, { q, r }) !== 1) {
       return send(ws, "step_rejected", { q, r, reason: "not_adjacent" });
+    }
+    const now = Date.now();
+    if (now - player.lastStepAt < this.stepCooldownFor(player, q, r)) {
+      return send(ws, "step_rejected", { q, r, reason: "too_soon" });
     }
     const rd = raceOf(player.race);
     if (!canEnterTerrain(this.tiles.getAt(q, r), rd.scoutCrossesHighMountain)) {
@@ -321,13 +503,16 @@ export class Room {
     const q = Number(msg.q), r = Number(msg.r);
     if (!BUILD_COST[kind] || !Number.isFinite(q) || !Number.isFinite(r)) return;
 
-    // Every building except TownHall must be near the player OR one of their own Builder units; TownHall
-    // only needs a Settler nearby (see below) — this is what lets a Settler found a new town far away,
-    // and a Builder construct things without the player character needing to be right there.
+    // TownHall placement still requires a nearby Settler (see below) — the actual founding
+    // mechanism for expanding to new territory. Every other building requires an available Builder
+    // within 1 tile — not already locked to another construction — which gets locked to this one
+    // for the duration; the client is responsible for auto-walking the closest available Builder
+    // into range before sending this message (see GameScene's placement flow).
+    let builderId = null;
     if (kind !== "TownHall") {
-      const nearPlayer = hexDistance({ q: player.q, r: player.r }, { q, r }) <= 1;
-      const nearBuilder = [...player.units.values()].some(u => u.kind === "Builder" && hexDistance({ q: u.q, r: u.r }, { q, r }) <= 1);
-      if (!nearPlayer && !nearBuilder) return send(ws, "build_rejected", { reason: "too_far" });
+      const found = [...player.units].find(([, u]) => u.kind === "Builder" && !u.constructingBuildingId && hexDistance({ q: u.q, r: u.r }, { q, r }) <= 1);
+      if (!found) return send(ws, "build_rejected", { reason: "need_builder" });
+      builderId = found[0];
     }
 
     const posKey = key(q, r);
@@ -336,6 +521,10 @@ export class Room {
     const rd = raceOf(player.race);
     const tile = this.tiles.getAt(q, r);
     if (!canPlace(kind, tile, rd)) return send(ws, "build_rejected", { reason: "invalid_tile" });
+
+    if (!this.isBuildingUnlocked(player, kind)) {
+      return send(ws, "build_rejected", { reason: "not_researched" });
+    }
 
     if (kind !== "TownHall") {
       const claim = this.claims.get(posKey);
@@ -356,17 +545,20 @@ export class Room {
     if (!canAfford(player.bank, cost)) return send(ws, "build_rejected", { reason: "cannot_afford" });
 
     let workers = 0;
-    if (!WORKER_EXEMPT.has(kind)) {
+    if (!WORKER_EXEMPT.has(kind) && !rd.hasCivilians) {
+      // Non-Human: the old instant abstract-worker model. Human buildings start unstaffed —
+      // the player assigns idle Civilians afterward (see civilians.js), which is what actually
+      // increments building.workers/player.usedWorkers once they arrive.
       workers = msg.workers === 2 ? 2 : 1;
       const available = player.popCap - player.usedWorkers;
       if (available < workers) return send(ws, "build_rejected", { reason: "not_enough_population" });
     }
 
-    spend(player.bank, cost);
+    spendResources(this, player, cost);
     if (kind === "Bridge" && tile.kind === "Water") tile.kind = "Bridge";
-    if (kind === "House") player.popCap += rd.popPerHouse;
+    if (kind === "House" && !rd.hasCivilians) player.popCap += rd.popPerHouse; // Human: civilians spawn on completion instead, see advanceConstruction()
     if (kind === "TownHall") {
-      player.popCap += rd.popPerTownHall;
+      if (!rd.hasCivilians) player.popCap += rd.popPerTownHall; // Human: civilians spawn on completion instead, see advanceConstruction()
       player.units.delete(settlerId);
     }
 
@@ -375,19 +567,50 @@ export class Room {
     const building = {
       id: uid(), kind, q, r, ownerId: player.id, workers,
       constructed: false, ticksRemaining: ticksNeeded, constructionTicks: ticksNeeded,
-      hp: 1, maxHp, lastAttackAt: 0, pendingTrain: null,
+      hp: 1, maxHp, lastAttackAt: 0, trainQueue: [], builderId,
     };
+    if (builderId) {
+      const builder = player.units.get(builderId);
+      if (builder) builder.constructingBuildingId = building.id;
+    }
+    if (kind === "Road") building.level = 1;
+    // Explicitly tag Human's other tiered buildings at level 1 too — this is what lets
+    // maxWorkersFor() (civilians.js) tell "a Human building genuinely at tier 1" apart from "a
+    // non-Human building that has no tier concept at all and should keep the old flat worker cap,"
+    // since both would otherwise read as building.level === undefined.
+    const GATHERING_AND_WAREHOUSE = new Set(["Lumberjack", "Farm", "Mine", "FishingBoat", "Warehouse"]);
+    if (rd.hasCivilians && GATHERING_AND_WAREHOUSE.has(kind)) building.level = 1;
     this.buildings.set(posKey, building);
 
     // Living Tree / Great Mines convert what they claim (simplified single-kind overwrite — see races.js note).
     const convertTo = kind === "TownHall" && rd.claimConvertsToForest ? "Forest" : null;
-    this.claimAround({ q, r }, player.id, player.color, player, convertTo);
+    const claimRadius = kind === "Road" ? ROAD_CLAIM_RADIUS : CLAIM_RADIUS;
+    this.claimAround({ q, r }, player.id, player.color, player, convertTo, claimRadius);
 
     player.usedWorkers += workers;
     player.ownedBuildings.push({ q, r });
     player.stats.built += 1;
     this._capCache.delete(player.id);
 
+    this._sendBank(ws, player);
+  }
+
+  /** Upgrades a basic (level 1) road to a stone (level 2) road — faster still, no further upgrade beyond that. */
+  handleUpgradeRoad(player, msg) {
+    const ws = this.clients.get(player.id);
+    const q = Number(msg.q), r = Number(msg.r);
+    if (!Number.isFinite(q) || !Number.isFinite(r)) return;
+
+    const building = this.buildings.get(key(q, r));
+    if (!building || building.kind !== "Road" || building.ownerId !== player.id) {
+      return send(ws, "build_rejected", { reason: "not_your_road" });
+    }
+    if (!building.constructed) return send(ws, "build_rejected", { reason: "still_constructing" });
+    if ((building.level ?? 1) >= 2) return send(ws, "build_rejected", { reason: "already_max_level" });
+    if (!canAfford(player.bank, ROAD_UPGRADE_COST)) return send(ws, "build_rejected", { reason: "cannot_afford" });
+
+    spendResources(this, player, ROAD_UPGRADE_COST);
+    building.level = 2;
     this._sendBank(ws, player);
   }
 
@@ -399,14 +622,21 @@ export class Room {
     }
     let cap = this._capCache.get(player.id);
     if (!cap) {
-      let bonus = 0;
-      for (const b of this.buildings.values()) {
-        if (b.ownerId !== player.id || !b.constructed) continue;
-        if (b.kind === "TownHall") bonus += TOWNHALL_STORAGE_BONUS;
-        else if (b.kind === "Warehouse") bonus += WAREHOUSE_STORAGE_BONUS;
+      if (raceOf(player.race).hasCivilians) {
+        cap = humanStorageCap(this, player);
+      } else {
+        let bonus = 0, goldBonus = 0;
+        for (const b of this.buildings.values()) {
+          if (b.ownerId !== player.id || !b.constructed) continue;
+          if (b.kind === "TownHall") bonus += TOWNHALL_STORAGE_BONUS;
+          else if (b.kind === "Warehouse") {
+            bonus += WAREHOUSE_STORAGE_BONUS;
+            if (player.race === "Dwarf") goldBonus += DWARF_VAULT_GOLD_BONUS;
+          }
+        }
+        const total = BASE_STORAGE_CAP + bonus;
+        cap = { Wood: total, Stone: total, Bread: total, Fish: total, Gold: total + goldBonus };
       }
-      const total = BASE_STORAGE_CAP + bonus;
-      cap = { Wood: total, Stone: total, Bread: total, Fish: total, Gold: total };
       this._capCache.set(player.id, cap);
     }
     return cap;
@@ -461,9 +691,65 @@ export class Room {
     if (ws) this.sendWorldSlice(player, ws);
   }
 
-  claimAround(center, ownerId, color, player, convertTo = null) {
+  /** Does any OTHER building this owner has (besides the one at excludeQ,excludeR) still justify a claim on this tile? */
+  _tileCoveredByOtherBuilding(q, r, ownerId, excludeQ, excludeR) {
+    for (const b of this.buildings.values()) {
+      if (b.ownerId !== ownerId) continue;
+      if (b.q === excludeQ && b.r === excludeR) continue;
+      if (hexDistance({ q, r }, { q: b.q, r: b.r }) <= CLAIM_RADIUS) return true;
+    }
+    return false;
+  }
+
+  /** A building changing hands (captured) takes the territory immediately around it with it. */
+  transferClaimsAround(building, newOwnerId, newColor) {
+    for (const c of diskCoords({ q: building.q, r: building.r }, CLAIM_RADIUS)) {
+      const k = key(c.q, c.r);
+      const claim = this.claims.get(k);
+      if (claim && claim.ownerId !== newOwnerId) {
+        this.claims.set(k, { ownerId: newOwnerId, color: newColor });
+        // A Road sitting on this tile belonged to whoever held the territory — when the territory
+        // changes hands (captured, stolen from an enemy), the road goes with it, matching how a
+        // road only ever benefits its owner's race in the first place.
+        const road = this.buildings.get(k);
+        if (road && road.kind === "Road" && road.ownerId !== newOwnerId) road.ownerId = newOwnerId;
+      }
+    }
+  }
+
+  /** A building being destroyed outright releases the territory it alone was justifying — unless
+   *  another of the same owner's surviving buildings also covers that ground, in which case it stays claimed. */
+  releaseClaimsAround(building) {
+    const ownerId = building.ownerId;
+    for (const c of diskCoords({ q: building.q, r: building.r }, CLAIM_RADIUS)) {
+      const k = key(c.q, c.r);
+      const claim = this.claims.get(k);
+      if (!claim || claim.ownerId !== ownerId) continue;
+      if (this._tileCoveredByOtherBuilding(c.q, c.r, ownerId, building.q, building.r)) continue;
+      this.claims.delete(k);
+    }
+  }
+
+  /** How long (ms) a single step to (q,r) takes for this player — their race's base speed, sped up if
+   *  the destination tile has one of their own roads on it. Roads only benefit their owner's race
+   *  having roads at all (currently just Human) — a non-Human standing on a Human road isn't sped up,
+   *  since baseTicksPerTile for every other race is already the same as a stone road's speed anyway. */
+  stepCooldownFor(player, q, r) {
+    const rd = raceOf(player.race);
+    let ticks = rd.baseTicksPerTile ?? 1;
+    if (rd.hasRoads) {
+      const road = this.buildings.get(key(q, r));
+      if (road && road.kind === "Road" && road.constructed) {
+        ticks = ROAD_SPEED_TICKS[road.level ?? 1] ?? ticks;
+      }
+    }
+    ticks = Math.max(1, ticks - heroItems.heroMoveSpeedBonus(player));
+    return ticks * this.stepCooldownMs;
+  }
+
+  claimAround(center, ownerId, color, player, convertTo = null, radius = CLAIM_RADIUS) {
     let newClaims = 0;
-    for (const c of diskCoords(center, CLAIM_RADIUS)) {
+    for (const c of diskCoords(center, radius)) {
       const k = key(c.q, c.r);
       if (!this.claims.has(k)) {
         this.claims.set(k, { ownerId, color });
@@ -490,28 +776,59 @@ export class Room {
     const building = this.buildings.get(posKey);
     if (!building || building.ownerId !== player.id) return send(ws, "build_rejected", { reason: "not_your_building" });
 
+    if (!building.constructed && building.builderId) {
+      const builder = player.units.get(building.builderId);
+      if (builder) builder.constructingBuildingId = null;
+    }
+
     const rd = raceOf(player.race);
     let popFreed = 0;
-    if (building.kind === "House") popFreed = rd.popPerHouse;
-    else if (building.kind === "TownHall") popFreed = rd.popPerTownHall;
+    if (building.kind === "House" && !rd.hasCivilians) popFreed = rd.popPerHouse; // Human: civilians already spawned don't vanish with the house
+    else if (building.kind === "TownHall" && !rd.hasCivilians) popFreed = rd.popPerTownHall;
 
     // Don't let freeing population from a House/TownHall drop capacity below what's currently in use elsewhere.
     if (popFreed > 0 && player.popCap - popFreed < player.usedWorkers) {
       return send(ws, "build_rejected", { reason: "population_in_use" });
     }
+    releaseCiviliansFrom(this, building); // free whoever was working here, regardless of race (no-op for races without civilians)
 
-    const cost = BUILD_COST[building.kind] || {};
-    const cap = this.storageCap(player);
-    for (const k of Object.keys(cost)) {
-      const refund = Math.round((cost[k] || 0) * DEMOLISH_REFUND_FRACTION);
-      player.bank[k] = Math.min(cap[k] ?? Infinity, (player.bank[k] || 0) + refund);
+    // Storage buildings hold real inventory for Human — pull out whatever's actually stored before
+    // the building is gone, same "resources tied to a specific building" logic as Warehouse capture.
+    const rdHasCivilians = raceOf(player.race).hasCivilians;
+    let stored = null;
+    if (rdHasCivilians && building.inventory && (building.kind === "TownHall" || building.kind === "Warehouse")) {
+      stored = { ...building.inventory };
     }
 
+    // Remove the building from the room BEFORE crediting any refund — otherwise, if this was the
+    // player's only storage building, the refund would credit right back into the very building
+    // about to disappear, leaving player.bank in a stale state the moment it's actually deleted
+    // (correct only until some unrelated event forces a recompute, which would silently wipe it).
     player.popCap -= popFreed;
     player.usedWorkers -= building.workers || 0;
     player.ownedBuildings = player.ownedBuildings.filter(b => !(b.q === q && b.r === r));
+    this.releaseClaimsAround(building);
     this.buildings.delete(posKey);
     this._capCache.delete(player.id);
+
+    const cost = BUILD_COST[building.kind] || {};
+    const refundAmounts = {};
+    for (const k of Object.keys(cost)) {
+      refundAmounts[k] = Math.round((cost[k] || 0) * DEMOLISH_REFUND_FRACTION);
+    }
+    if (stored) for (const k of Object.keys(stored)) refundAmounts[k] = (refundAmounts[k] || 0) + stored[k];
+    creditResources(this, player, refundAmounts);
+
+    // creditResources' non-Human path (a plain bank add) doesn't cap against storage capacity the
+    // way the Human building-based path naturally does — clamp explicitly here so a refund can't
+    // push a non-Human player's bank above what their buildings can actually hold (matches the old
+    // behavior this replaced, and the same pattern diplomacy.js already uses for trade credits).
+    if (!rdHasCivilians) {
+      const cap = this.storageCap(player);
+      for (const k of Object.keys(cap)) {
+        if (player.bank[k] > cap[k]) player.bank[k] = cap[k];
+      }
+    }
 
     this._sendBank(ws, player);
   }
@@ -524,7 +841,43 @@ export class Room {
         b.ticksRemaining = 0;
         b.constructed = true;
         b.hp = b.maxHp;
+        if (b.builderId) {
+          const owner = this.players.get(b.ownerId);
+          const builder = owner?.units.get(b.builderId);
+          if (builder) builder.constructingBuildingId = null;
+        }
         if (b.kind === "TownHall" || b.kind === "Warehouse") this._capCache.delete(b.ownerId); // its storage bonus just started counting
+        if (b.kind === "TownHall" || b.kind === "Warehouse") {
+          const owner = this.players.get(b.ownerId);
+          if (owner && raceOf(owner.race).hasCivilians) initStorageInventory(this, owner, b);
+        }
+        if (b.kind === "House" || b.kind === "TownHall") {
+          const owner = this.players.get(b.ownerId);
+          const rd = owner && raceOf(owner.race);
+          if (owner && rd?.hasCivilians) {
+            if (b.kind === "TownHall") {
+              // 1 Builder (a real unit, distinct from the Civilian worker economy) + one fewer
+              // Civilian than before, so every player starts with a Builder to actually construct
+              // things with. Free of popCost like a Civilian, with a matching +1 popCap, so this
+              // doesn't quietly eat into population capacity compared to the old all-Civilian spawn.
+              const civCount = Math.max(0, (rd.civiliansPerTownHall ?? 2) - 1);
+              spawnCivilians(this, owner, b, civCount);
+              const builderDef = UNIT_DEFS.Builder;
+              const builderUnit = {
+                id: uid(), kind: "Builder", level: 1, guard: false, q: b.q, r: b.r,
+                lastStepAt: 0, lastActionAt: 0, hp: builderDef.hp, maxHp: builderDef.hp, popCost: 0,
+              };
+              owner.units.set(builderUnit.id, builderUnit);
+              owner.popCap += 1;
+            } else {
+              spawnCivilians(this, owner, b, rd.civiliansPerHouse ?? 4);
+            }
+          }
+        }
+        {
+          const owner = this.players.get(b.ownerId);
+          if (owner && raceOf(owner.race).hasCivilians) { tryAutoConnectRoad(this, owner, b); tryAutoAssignWorker(this, owner, b); }
+        }
       } else {
         const progress = (b.constructionTicks - b.ticksRemaining) / b.constructionTicks;
         b.hp = Math.max(1, Math.round(1 + (b.maxHp - 1) * progress));
@@ -559,7 +912,7 @@ export class Room {
     for (const [id, player] of this.players) {
       const isWinner = id === winnerId;
       const finalScore = isWinner ? winnerFinalScore : Math.round(player.score);
-      recordGameEnd(player.token, finalScore, player.race, player.stats)
+      recordGameEnd(player.token, finalScore, player.race, player.stats, !!player.isBot)
         .catch((err) => log(`[room ${this.id}] recordGameEnd (win) failed for ${id}: ${err.message}`));
 
       const ws = this.clients.get(id);
@@ -589,6 +942,15 @@ export class Room {
     units.advanceTraining(this);
     research.advanceResearch(this);
     advancePriestActions(this);
+    advanceBuilderRepair(this, dtSec);
+    this.advanceAbandonedDecay(dtSec);
+    advanceMonasteryHealing(this, dtSec);
+    advanceCivilianTravel(this);
+    advanceCivilianDelivery(this);
+    advanceCivilianReturnHome(this);
+    advanceCivilianRespawns(this);
+    advanceWarehouseRoving(this);
+    advanceBotAI(this);
 
     if (this.tickCount % ATTACK_COOLDOWN_TICKS === 0) { // reusing this cadence for "every few ticks" race effects too
       raceEffects.advanceScorchedEarth(this);
@@ -608,13 +970,26 @@ export class Room {
       if (winResult) { this.endGameByWin(winResult.winnerId, winResult.reason); return; }
     }
 
+    if (this.tickCount % BOT_BACKFILL_CHECK_TICKS === 0) {
+      ensureBotsFilled(this, this.cfg.targetLobbySize);
+    }
+
     for (const b of this.buildings.values()) {
       const owner = this.players.get(b.ownerId);
       if (owner) {
-        const scoreRef = { value: 0 };
-        gatherTick(this.tiles, b, dtSec, owner.bank, scoreRef, research.effectiveRaceData(owner), this.storageCap(owner));
-        owner.score += scoreRef.value * SCORE.gatherPerUnit;
-        owner.stats.gathered += scoreRef.value;
+        const rd = raceOf(owner.race);
+        if (rd.hasCivilians) {
+          // Human: discrete, presence-gated gathering (see humanEconomy.js's advanceHumanGathering) —
+          // a flat 1 resource every 6 ticks, only while an assigned Civilian is physically standing
+          // at the building right now (not off on a delivery run). Handles its own score/stats.
+          advanceHumanGathering(this, b);
+          if (b.kind === "House") advanceHouseTax(this, b);
+        } else {
+          const scoreRef = { value: 0 };
+          gatherTick(this.tiles, b, dtSec, owner.bank, scoreRef, research.effectiveRaceData(owner), this.storageCap(owner));
+          owner.score += scoreRef.value * SCORE.gatherPerUnit;
+          owner.stats.gathered += scoreRef.value;
+        }
       }
     }
 
@@ -655,7 +1030,8 @@ export class Room {
         }
       }
       for (const u of player.units.values()) {
-        for (const c of diskCoords({ q: u.q, r: u.r }, SCOUT_VISION_RADIUS)) {
+        const radius = SCOUT_VISION_RADIUS + (UNIT_VISION_BONUS[u.kind] || 0);
+        for (const c of diskCoords({ q: u.q, r: u.r }, radius)) {
           const k = key(c.q, c.r);
           if (!visible.has(k)) visible.set(k, c);
         }
@@ -670,7 +1046,7 @@ export class Room {
       const claim = this.claims.get(k);
       const prev = player.knownTiles.get(k);
       if (!prev || prev.kind !== t.kind || prev.resLeft !== t.resLeft || prev.claimedBy !== (claim?.ownerId) || prev.blocked !== !!t.blocked) {
-        changedTiles.push(claim ? { ...t, claimedBy: { id: claim.ownerId, color: claim.color, name: this.players.get(claim.ownerId)?.name ?? "" } } : t);
+        changedTiles.push(claim ? { ...t, claimedBy: { id: claim.ownerId, color: claim.color, name: this.players.get(claim.ownerId)?.name ?? "", race: this.players.get(claim.ownerId)?.race ?? "Human" } } : t);
         player.knownTiles.set(k, { kind: t.kind, resLeft: t.resLeft, claimedBy: claim?.ownerId, blocked: !!t.blocked });
       }
     }
@@ -701,7 +1077,16 @@ export class Room {
     for (const [otherId, other] of this.players) {
       for (const u of other.units.values()) {
         if (visibleKeys.has(key(u.q, u.r))) {
-          unitsOut.push({ id: u.id, ownerId: otherId, kind: u.kind, level: u.level || 1, guard: !!u.guard, q: u.q, r: u.r, color: other.color, hp: u.hp, maxHp: u.maxHp });
+          unitsOut.push({
+            id: u.id, ownerId: otherId, kind: u.kind, level: u.level || 1, guard: !!u.guard, q: u.q, r: u.r, color: other.color, hp: u.hp, maxHp: u.maxHp,
+            homeBuildingId: u.kind === "Civilian" ? u.homeBuildingId ?? null : undefined,
+            assignedTo: u.kind === "Civilian" ? u.assignedTo ?? null : undefined,
+            moving: u.kind === "Civilian" ? !!(u.travel || u.delivery || u.roving || u.returningHome) : undefined,
+            carrying: u.kind === "Civilian"
+              ? (u.delivery?.resourceKind ? { kind: u.delivery.resourceKind, amount: u.delivery.amount } : u.roving?.resourceKind ? { kind: u.roving.resourceKind, amount: u.roving.amount } : null)
+              : undefined,
+            constructingBuildingId: u.kind === "Builder" ? u.constructingBuildingId ?? null : undefined,
+          });
         }
       }
     }

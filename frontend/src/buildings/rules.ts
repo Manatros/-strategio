@@ -2,6 +2,7 @@
 import type { BuildingKind } from "./types";
 import type { Tile } from "../hex/types";
 import { raceDisplay } from "../core/races";
+import { isPassable } from "../hex/helpers";
 
 export function canPlace(kind: BuildingKind, t: Tile | undefined, race?: string): boolean {
   if (!t) return false;
@@ -15,6 +16,8 @@ export function canPlace(kind: BuildingKind, t: Tile | undefined, race?: string)
     case "Warehouse":   return t.kind === "Grass";
     case "Outpost":     return t.kind === "Grass";
     case "Church":      return t.kind === "Grass";
+    case "Road":        return race === "Human" && isPassable(t);
+    case "Monastery":   return race === "Human" && t.kind === "Grass";
     case "Lumberjack":  return t.kind === "Forest";
     case "Farm":        return t.kind === "Fields";
     case "Mine":        return t.kind === "Stone" || t.kind === "HighMountain";

@@ -5,7 +5,7 @@
 import { makeDraggable } from "./draggable";
 import type { RelationStatus, ResourceAmounts, ProposalType } from "../net";
 
-export type MetPlayer = { id: string; name: string; tag: string; color: number };
+export type MetPlayer = { id: string; name: string; tag: string; color: number; race: string };
 
 export type DiplomacyRefs = {
   root: HTMLElement;
@@ -85,7 +85,7 @@ export function refreshDiplomacyPlayers(refs: DiplomacyRefs, players: MetPlayer[
     return `
       <div class="dip-row" style="border-bottom:1px solid #222;padding:6px 0">
         <div class="row" style="justify-content:space-between">
-          <span><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${swatch};margin-right:6px"></span>${escapeHtml(p.name)}<small style="opacity:0.6">#${p.tag}</small></span>
+          <span><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${swatch};margin-right:6px"></span>${escapeHtml(p.name)}<small style="opacity:0.6">#${p.tag}</small> <small style="opacity:0.7">(${escapeHtml(p.race)})</small></span>
           <small>${relLabel}</small>
         </div>
         <div class="row" style="gap:4px;margin-top:4px;flex-wrap:wrap">

@@ -34,7 +34,7 @@ export function attachHUD(mount: HTMLElement, isAdmin: boolean) {
   mount.appendChild(hud);
 
   const basicPanel = hud.querySelector<HTMLElement>("#debug-basic")!;
-  makeDraggable(basicPanel, { id: "debug-panel", defaultPos: () => ({ x: 12, y: 12 }) });
+  makeDraggable(basicPanel, { id: "debug-panel", defaultPos: (el) => ({ x: window.innerWidth / 2 - el.offsetWidth / 2, y: 48 }) });
 
   let logEl: HTMLElement | null = null;
   let consoleEl: HTMLElement | null = null;
@@ -71,7 +71,7 @@ export function attachHUD(mount: HTMLElement, isAdmin: boolean) {
       <div id="admin-console" style="margin-top:4px;font-family:monospace;font-size:11px;max-height:110px;overflow-y:auto;background:#2a1010;border-radius:3px;padding:4px"></div>
     `;
     hud.appendChild(adminPanel);
-    makeDraggable(adminPanel, { id: "admin-debug-panel", defaultPos: () => ({ x: 12, y: 150 }) });
+    makeDraggable(adminPanel, { id: "admin-debug-panel", defaultPos: () => ({ x: 320, y: 48 }) });
 
     logEl = adminPanel.querySelector("#admin-log") as HTMLElement;
     consoleEl = adminPanel.querySelector("#admin-console") as HTMLElement;

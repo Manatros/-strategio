@@ -1,6 +1,8 @@
 // src/ui/UnitHUD.ts
 import { makeDraggable } from "./draggable";
 
+const RESOURCE_ICON: Record<string, string> = { Wood: "🪵", Stone: "🪨", Bread: "🍞", Fish: "🐟", Gold: "🪙" };
+
 export type UnitHUDRefs = {
   root: HTMLElement;
   listEl: HTMLElement;
@@ -11,7 +13,7 @@ export type UnitHUDRefs = {
 
 // The always-available roster. Race-specific extras (Necromancer for Undead, Brawler for Orc) are
 // appended by the caller at creation time, once the player's race is known — see GameScene.mount().
-const BASE_TRAINABLE_KINDS = ["Scout", "Soldier", "Archer", "Builder", "Priest"];
+const BASE_TRAINABLE_KINDS = ["Scout", "Soldier", "Archer", "Settler", "Builder", "Priest"];
 
 export function createUnitHUD(
   mount: HTMLElement,
@@ -114,14 +116,31 @@ export function refreshAbilities(
   refs: UnitHUDRefs,
   selectedKind: string | null, // null = main character selected (or nothing)
   autoExploreOn: boolean,
-  guardOn: boolean
+  guardOn: boolean,
+  stats: { hp: number; maxHp: number; level: number } | null = null,
+  carrying: { kind: string; amount: number } | null = null,
+  myRace: string = "",
+  onForage: () => void = () => {},
+  onStop: () => void = () => {}
 ) {
+  const statsLine = stats
+    ? `<div style="margin-bottom:4px"><strong>${selectedKind ?? "You"}</strong> — Lv.${stats.level} · HP ${Math.max(0, Math.round(stats.hp))}/${stats.maxHp}</div>`
+    : "";
+
+  const stopBtn = document.createElement("button");
+  stopBtn.className = "btn";
+  stopBtn.textContent = "Stop";
+  stopBtn.title = "Clears this unit's queued movement path";
+  stopBtn.style.marginBottom = "4px";
+  stopBtn.onclick = () => onStop();
+
   if (!selectedKind) {
-    refs.abilitiesEl.innerHTML = `<small>Select a unit to see what it can do</small>`;
+    refs.abilitiesEl.innerHTML = statsLine || `<small>Select a unit to see what it can do</small>`;
+    if (stats) refs.abilitiesEl.appendChild(stopBtn);
     return;
   }
   if (selectedKind === "Soldier" || selectedKind === "Archer") {
-    refs.abilitiesEl.innerHTML = `<small>Attack: click an enemy unit, building, or player within range</small>`;
+    refs.abilitiesEl.innerHTML = `${statsLine}<small>Attack: click an enemy unit, building, or player within range</small>`;
     const btn = document.createElement("button");
     btn.className = "btn";
     btn.dataset.ability = "guard";
@@ -130,27 +149,38 @@ export function refreshAbilities(
     btn.style.marginTop = "4px";
     if (guardOn) btn.style.outline = "2px solid #fff";
     refs.abilitiesEl.appendChild(btn);
+    refs.abilitiesEl.appendChild(stopBtn);
     return;
   }
   if (selectedKind === "Settler") {
-    refs.abilitiesEl.innerHTML = `<small>Found Town: build a Town Hall while I'm next to it — I'll be used up</small>`;
+    refs.abilitiesEl.innerHTML = `${statsLine}<small>Found Town: build a Town Hall while I'm next to it — I'll be used up</small>`;
+    refs.abilitiesEl.appendChild(stopBtn);
     return;
   }
   if (selectedKind === "Builder") {
-    refs.abilitiesEl.innerHTML = `<small>Can place buildings just like you can — select me, then use the build menu near me instead of near your character</small>`;
+    refs.abilitiesEl.innerHTML = `${statsLine}<small>Can place buildings just like you can — select me, then use the build menu near me instead of near your character. Also passively repairs any damaged building of yours I'm standing on or next to.</small>`;
+    refs.abilitiesEl.appendChild(stopBtn);
     return;
   }
   if (selectedKind === "Priest") {
-    refs.abilitiesEl.innerHTML = `<small>Passive — no clicking needed. Standing on enemy scorched-earth territory cleanses it; standing on an enemy building you're at war with slowly captures it.</small>`;
+    refs.abilitiesEl.innerHTML = `${statsLine}<small>Passive — no clicking needed. Standing on enemy scorched-earth territory cleanses it; standing on an enemy building you're at war with slowly captures it.</small>`;
+    refs.abilitiesEl.appendChild(stopBtn);
+    return;
+  }
+  if (selectedKind === "Civilian") {
+    const inventoryLine = carrying && carrying.amount > 0
+      ? `<div>Carrying: <strong>${RESOURCE_ICON[carrying.kind] ?? ""} ${Math.round(carrying.amount)} ${carrying.kind}</strong></div>`
+      : `<div>Carrying: <small>Empty</small></div>`;
+    refs.abilitiesEl.innerHTML = `${statsLine}${inventoryLine}<small>Click one of your own buildings that needs a worker (not already staffed by 2) to send me there — I'll walk over and start working once I arrive.</small>`;
     return;
   }
   if (selectedKind === "Scout" || selectedKind === "Necromancer") {
+    refs.abilitiesEl.innerHTML = statsLine;
     const btn = document.createElement("button");
     btn.className = "btn";
     btn.dataset.ability = "auto-explore";
     btn.textContent = autoExploreOn ? "Auto-Explore: ON" : "Auto-Explore: OFF";
     if (autoExploreOn) btn.style.outline = "2px solid #fff";
-    refs.abilitiesEl.innerHTML = "";
     refs.abilitiesEl.appendChild(btn);
     if (selectedKind === "Necromancer") {
       const note = document.createElement("div");
@@ -158,9 +188,25 @@ export function refreshAbilities(
       note.style.marginTop = "4px";
       refs.abilitiesEl.appendChild(note);
     }
+    if (selectedKind === "Scout" && myRace === "Elf") {
+      const forageBtn = document.createElement("button");
+      forageBtn.className = "btn";
+      forageBtn.textContent = "Forage";
+      forageBtn.title = "Instantly gather resources from the tile you're standing on (Forest/Fields/Stone/Water) — on a cooldown";
+      forageBtn.style.marginTop = "4px";
+      forageBtn.onclick = () => onForage();
+      refs.abilitiesEl.appendChild(forageBtn);
+    }
+    refs.abilitiesEl.appendChild(stopBtn);
     return;
   }
-  refs.abilitiesEl.innerHTML = `<small>No special abilities</small>`;
+  if (selectedKind === "Brawler") {
+    refs.abilitiesEl.innerHTML = `${statsLine}<small><strong>Berserker:</strong> deals up to +50% damage as this Brawler's own hp drops — most dangerous right at the edge of death.</small>`;
+    refs.abilitiesEl.appendChild(stopBtn);
+    return;
+  }
+  refs.abilitiesEl.innerHTML = `${statsLine}<small>No special abilities</small>`;
+  refs.abilitiesEl.appendChild(stopBtn);
 }
 
 export function refreshUnitHUD(

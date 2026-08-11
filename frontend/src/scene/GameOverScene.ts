@@ -24,7 +24,10 @@ export class GameOverScene implements Scene {
         headline = `${this.winInfo.winnerName} (${this.winInfo.winnerRace}) achieved Domination Victory.`;
       }
     } else {
-      headline = this.reason === "killed" ? "You were defeated." : "Game over.";
+      headline = this.reason === "killed" ? "You were defeated."
+        : this.reason === "surrendered" ? "You surrendered."
+        : this.reason === "no_townhalls_remaining" ? "Your last TownHall fell."
+        : "Game over.";
     }
 
     wrap.innerHTML = `

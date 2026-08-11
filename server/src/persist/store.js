@@ -26,6 +26,9 @@ export const {
   verifyAccountLogin,
   getIsAdmin,
   setAdmin,
+  setAdminByNameTag,
+  getKeybindings,
+  setKeybindings,
   getHighscores,
   flush,
 } = backend;

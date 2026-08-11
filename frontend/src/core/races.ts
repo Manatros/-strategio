@@ -14,8 +14,8 @@ export type RaceDisplay = {
 export const RACE_DISPLAY: Record<Race, RaceDisplay> = {
   Human: {
     label: "Human",
-    blurb: "Balanced and straightforward — no restrictions, no surprises.",
-    buildingNames: { TownHall: "Town Hall", House: "House", Lumberjack: "Lumberjack", Mine: "Mine", Farm: "Farm", FishingBoat: "Fishing Boat", Garrison: "Garrison", ArcherTower: "Archer Tower", Research: "Library", Warehouse: "Warehouse", Outpost: "Outpost", Church: "Church" },
+    blurb: "Moves slower than everyone else by default — build roads to catch up, or exceed it.",
+    buildingNames: { TownHall: "Town Hall", House: "House", Lumberjack: "Lumberjack", Mine: "Mine", Farm: "Farm", FishingBoat: "Fishing Boat", Garrison: "Garrison", ArcherTower: "Archer Tower", Research: "Library", Warehouse: "Warehouse", Outpost: "Outpost", Church: "Church", Road: "Road", Monastery: "Monastery" },
     unitNames: { Soldier: "Soldier", Archer: "Archer", Scout: "Scout", Settler: "Settler", Builder: "Builder", Priest: "Priest" },
     townHallTerrain: "Grass",
     houseTerrain: "Grass",

@@ -1,4 +1,4 @@
- // Win conditions are a pluggable list: each is a function(room) that
+// Win conditions are a pluggable list: each is a function(room) that
 // returns null (no winner yet) or { winnerId, reason }. To add a new win
 // condition later, write one function and add it to WIN_CONDITIONS below —
 // checkWinConditions() and everything that calls it doesn't need to change.

@@ -3,10 +3,11 @@
 // Every function takes `room` explicitly instead of using `this`, so this
 // stays a plain, testable module rather than being tangled into Room.
 import { send } from "../net/wire.js";
-import { canAfford, spend, add } from "../world/economy.js";
+import { canAfford } from "../world/economy.js";
 import { raceOf } from "../world/races.js";
 import { uid } from "../utils/uid.js";
 import { PROPOSAL_MAX_AGE_MS } from "../config/balance.js";
+import { spendResources, creditResources } from "./humanEconomy.js";
 
 const RESOURCE_KEYS = ["Wood", "Stone", "Bread", "Fish", "Gold"];
 
@@ -112,12 +113,12 @@ export function handleRespondProposal(room, player, msg) {
       if (toWs) send(toWs, "proposal_result", { id: proposal.id, proposalType: proposal.type, accepted: false, withId: proposal.fromId, reason: "cannot_afford" });
       return;
     }
-    spend(fromPlayer.bank, proposal.offer);
-    add(fromPlayer.bank, proposal.request);
-    clampToCap(room, fromPlayer);
-    spend(player.bank, proposal.request);
-    add(player.bank, proposal.offer);
-    clampToCap(room, player);
+    spendResources(room, fromPlayer, proposal.offer);
+    creditResources(room, fromPlayer, proposal.request);
+    if (!raceOf(fromPlayer.race).hasCivilians) clampToCap(room, fromPlayer);
+    spendResources(room, player, proposal.request);
+    creditResources(room, player, proposal.offer);
+    if (!raceOf(player.race).hasCivilians) clampToCap(room, player);
     if (fromWs) room._sendBank(fromWs, fromPlayer);
     room._sendBank(toWs, player);
   } else if (proposal.type === "demand") {
@@ -125,9 +126,9 @@ export function handleRespondProposal(room, player, msg) {
       if (fromWs) send(fromWs, "proposal_result", { id: proposal.id, proposalType: proposal.type, accepted: false, withId: player.id, reason: "cannot_afford" });
       return;
     }
-    spend(player.bank, proposal.request);
-    add(fromPlayer.bank, proposal.request);
-    clampToCap(room, fromPlayer);
+    spendResources(room, player, proposal.request);
+    creditResources(room, fromPlayer, proposal.request);
+    if (!raceOf(fromPlayer.race).hasCivilians) clampToCap(room, fromPlayer);
     room._sendBank(toWs, player);
     if (fromWs) room._sendBank(fromWs, fromPlayer);
   }

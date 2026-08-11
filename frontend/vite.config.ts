@@ -23,6 +23,9 @@ export default defineConfig({
       "/room-stats": BACKEND,
       "/health": BACKEND,
       "/version": BACKEND,
+      "/can-resume": BACKEND,
+      "/achievements": BACKEND,
+      "/keybindings": BACKEND,
     },
   },
   build: {

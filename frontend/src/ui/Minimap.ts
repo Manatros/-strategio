@@ -49,7 +49,32 @@ export class Minimap {
     this.canvas.addEventListener("pointerdown", (e) => {
       dragging = true; moved = false; lastX = e.clientX; lastY = e.clientY;
       this.canvas.style.cursor = "grabbing";
+      e.stopPropagation();
     });
+    this.canvas.addEventListener("pointermove", (e) => {
+      if (!dragging) return;
+      const dx = e.clientX - lastX, dy = e.clientY - lastY;
+      if (Math.abs(dx) > 2 || Math.abs(dy) > 2) moved = true;
+      this.panX += dx; this.panY += dy;
+      lastX = e.clientX; lastY = e.clientY;
+      e.stopPropagation();
+    });
+    this.canvas.addEventListener("pointerup", (e) => {
+      if (dragging && !moved && this.onRecenter && this.lastTransform) {
+        const rect = this.canvas.getBoundingClientRect();
+        const cx = (e.clientX - rect.left) * (this.canvas.width / rect.width);
+        const cy = (e.clientY - rect.top) * (this.canvas.height / rect.height);
+        const { ox, oy, scale } = this.lastTransform;
+        const worldY = (cy - oy) / scale;       // = r
+        const worldX = (cx - ox) / scale;       // = q + r/2
+        this.onRecenter(worldX - worldY / 2, worldY);
+      }
+      dragging = false;
+      this.canvas.style.cursor = "grab";
+      e.stopPropagation();
+    });
+    // Still need window-level pointerup/pointermove for drags that continue past the canvas edge —
+    // but only act on them, don't let a canvas-scoped listener plus these double-fire the same event.
     window.addEventListener("pointermove", (e) => {
       if (!dragging) return;
       const dx = e.clientX - lastX, dy = e.clientY - lastY;
@@ -63,8 +88,8 @@ export class Minimap {
         const cx = (e.clientX - rect.left) * (this.canvas.width / rect.width);
         const cy = (e.clientY - rect.top) * (this.canvas.height / rect.height);
         const { ox, oy, scale } = this.lastTransform;
-        const worldY = (cy - oy) / scale;       // = r
-        const worldX = (cx - ox) / scale;       // = q + r/2
+        const worldY = (cy - oy) / scale;
+        const worldX = (cx - ox) / scale;
         this.onRecenter(worldX - worldY / 2, worldY);
       }
       dragging = false;

@@ -1,0 +1,12 @@
+# ads.txt — Authorized Digital Sellers file, required by Google AdSense.
+#
+# REPLACE the placeholder line below with your real publisher ID once your
+# AdSense account is approved. The format is exactly:
+#   google.com, pub-XXXXXXXXXXXXXXXX, DIRECT, f08c47fec0942fa0
+# Your real "pub-XXXXXXXXXXXXXXXX" value is shown in your AdSense account
+# under Account > Settings > Account information.
+#
+# This file MUST be served at exactly https://yourdomain.com/ads.txt (root
+# of the domain, not a subpath) for AdSense to recognize it.
+
+google.com, pub-0000000000000000, DIRECT, f08c47fec0942fa0

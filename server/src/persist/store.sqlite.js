@@ -27,6 +27,7 @@ db.exec(`
     tag TEXT,
     color INTEGER NOT NULL DEFAULT 3830271,
     best_score REAL NOT NULL DEFAULT 0,
+    total_score REAL NOT NULL DEFAULT 0,
     games_played INTEGER NOT NULL DEFAULT 0,
     race TEXT,
     stats_json TEXT,
@@ -57,6 +58,23 @@ if (!existingCols.includes("is_admin")) {
   db.exec("ALTER TABLE players ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0");
   log("[store:sqlite] migrated schema: added is_admin column");
 }
+if (!existingCols.includes("keybindings_json")) {
+  db.exec("ALTER TABLE players ADD COLUMN keybindings_json TEXT");
+  log("[store:sqlite] migrated schema: added keybindings_json column");
+}
+if (!existingCols.includes("total_score")) {
+  // Backfill: for anyone who already has games recorded, we only ever kept their best score, not a
+  // running total — seed total_score with best_score as a reasonable starting point rather than 0
+  // (0 would make an established player's cumulative total look artificially like a brand-new player's).
+  db.exec("ALTER TABLE players ADD COLUMN total_score REAL NOT NULL DEFAULT 0");
+  db.exec("UPDATE players SET total_score = best_score");
+  log("[store:sqlite] migrated schema: added total_score column (backfilled from best_score)");
+}
+// Safe to run unconditionally either way: a fresh database already has the column (from CREATE
+// TABLE above, so the migration branch just above was skipped) but still needs this index; an
+// existing database just had the column added by that branch. CREATE INDEX IF NOT EXISTS is a
+// no-op if it's already there from a previous run.
+db.exec("CREATE INDEX IF NOT EXISTS idx_players_total_score ON players(total_score DESC)");
 
 migrateFromJsonIfNeeded();
 
@@ -140,7 +158,7 @@ function rowToRecord(row) {
   if (!row) return null;
   return {
     name: row.name, tag: row.tag, color: row.color,
-    bestScore: row.best_score, gamesPlayed: row.games_played,
+    bestScore: row.best_score, totalScore: row.total_score, gamesPlayed: row.games_played,
     race: row.race, stats: row.stats_json ? JSON.parse(row.stats_json) : null,
     ownedRaces: JSON.parse(row.owned_races_json),
     achievements: JSON.parse(row.achievements_json || "[]"),
@@ -179,29 +197,34 @@ export async function upsertIdentity(token, { name, color }) {
   return getPlayerRecord(token);
 }
 
-export async function recordGameEnd(token, finalScore, race, stats) {
-  const existing = db.prepare("SELECT best_score, games_played FROM players WHERE token = ?").get(token);
+export async function recordGameEnd(token, finalScore, race, stats, isBot = false) {
+  if (isBot) return; // bot games are never persisted — no identity worth tracking across sessions
+  const existing = db.prepare("SELECT best_score, total_score, games_played FROM players WHERE token = ?").get(token);
   const gamesPlayed = (existing ? existing.games_played : 0) + 1;
   const shouldUpdateBest = !existing || finalScore >= existing.best_score;
+  const newTotalScore = (existing ? existing.total_score : 0) + finalScore;
 
   db.prepare(`
-    INSERT INTO players (token, name, best_score, games_played, race, stats_json)
-    VALUES (@token, 'Player', @score, @gamesPlayed, @race, @statsJson)
+    INSERT INTO players (token, name, best_score, total_score, games_played, race, stats_json)
+    VALUES (@token, 'Player', @score, @newTotalScore, @gamesPlayed, @race, @statsJson)
     ON CONFLICT(token) DO UPDATE SET
       games_played = @gamesPlayed,
-      best_score = CASE WHEN @shouldUpdateBest THEN @score ELSE best_score END,
-      race        = CASE WHEN @shouldUpdateBest THEN @race ELSE race END,
-      stats_json  = CASE WHEN @shouldUpdateBest THEN @statsJson ELSE stats_json END
+      total_score  = @newTotalScore,
+      best_score   = CASE WHEN @shouldUpdateBest THEN @score ELSE best_score END,
+      race         = CASE WHEN @shouldUpdateBest THEN @race ELSE race END,
+      stats_json   = CASE WHEN @shouldUpdateBest THEN @statsJson ELSE stats_json END
   `).run({
-    token, score: finalScore, gamesPlayed, race,
+    token, score: finalScore, newTotalScore, gamesPlayed, race,
     statsJson: stats ? JSON.stringify(stats) : null,
     shouldUpdateBest: shouldUpdateBest ? 1 : 0,
   });
 }
 
-const FREE_RACES = ["Human", "Orc", "Elf", "Dwarf", "Undead"]; // TEMPORARY: everyone can play every race for now.
-// To re-enable monetization later, change this back to just ["Human"] — nothing else changes;
-// grantRaceEntitlement, /admin/grant-race, and the menu's lock icons all still work unchanged.
+// Every race is free, permanently — the game is funded by donations, not race unlocks. The
+// entitlement machinery below (grantRaceEntitlement, /admin/grant-race) is left in place since
+// it's harmless and could still be useful for something else later (e.g. a donation-linked
+// cosmetic), but nothing currently gates access behind it.
+const FREE_RACES = ["Human", "Orc", "Elf", "Dwarf", "Undead"];
 
 export async function getOwnedRaces(token) {
   const row = db.prepare("SELECT owned_races_json FROM players WHERE token = ?").get(token);
@@ -258,10 +281,39 @@ export async function setAdmin(token, isAdmin) {
   `).run({ token, isAdmin: isAdmin ? 1 : 0 });
 }
 
-export async function getHighscores(limit = 50) {
-  const rows = db.prepare("SELECT * FROM players ORDER BY best_score DESC LIMIT ?").all(limit);
+/** Same as setAdmin, but looks the player up by name#tag instead of requiring the raw token —
+ *  more convenient for granting admin to a specific known player. Returns false if no player with
+ *  that exact name#tag has ever connected (nothing to grant admin to). */
+export async function setAdminByNameTag(name, tag, isAdmin) {
+  const row = db.prepare("SELECT token FROM players WHERE name = ? AND tag = ?").get(name, tag);
+  if (!row) return false;
+  db.prepare("UPDATE players SET is_admin = ? WHERE token = ?").run(isAdmin ? 1 : 0, row.token);
+  return true;
+}
+
+/** Keybindings are keyed by token, same as everything else — this is what makes them naturally
+ *  follow an account across devices: logging in adopts the account's stable token (see
+ *  /auth/login), so from that point on the same row is read/written regardless of which device
+ *  connects. Without an account, the token is just a random per-browser one, so bindings persist
+ *  locally but don't follow you anywhere else — "saved as good as they can without an account." */
+export async function getKeybindings(token) {
+  const row = db.prepare("SELECT keybindings_json FROM players WHERE token = ?").get(token);
+  return row?.keybindings_json ? JSON.parse(row.keybindings_json) : null;
+}
+
+export async function setKeybindings(token, bindings) {
+  db.prepare(`
+    INSERT INTO players (token, name, keybindings_json) VALUES (@token, 'Player', @bindings)
+    ON CONFLICT(token) DO UPDATE SET keybindings_json = @bindings
+  `).run({ token, bindings: JSON.stringify(bindings) });
+}
+
+/** sortBy: "best" (highest single-game score, the original leaderboard) or "total" (cumulative score across every game). */
+export async function getHighscores(limit = 50, sortBy = "best") {
+  const column = sortBy === "total" ? "total_score" : "best_score";
+  const rows = db.prepare(`SELECT * FROM players ORDER BY ${column} DESC LIMIT ?`).all(limit);
   return rows.map((row) => ({
-    name: row.name, tag: row.tag || null, color: row.color, bestScore: row.best_score, gamesPlayed: row.games_played,
+    name: row.name, tag: row.tag || null, color: row.color, bestScore: row.best_score, totalScore: row.total_score, gamesPlayed: row.games_played,
     race: row.race || null, stats: row.stats_json ? JSON.parse(row.stats_json) : null,
   }));
 }

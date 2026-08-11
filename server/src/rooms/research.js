@@ -4,9 +4,40 @@
 // and do you have the building" — real depth (tiers, exclusivity) can be
 // layered on top of this later without changing the wire protocol.
 import { send } from "../net/wire.js";
-import { canAfford, spend } from "../world/economy.js";
+import { key } from "../world/hex.js";
+import { canAfford } from "../world/economy.js";
 import { raceOf } from "../world/races.js";
-import { RESEARCH_OPTIONS } from "../config/balance.js";
+import { RESEARCH_OPTIONS, BUILDING_UNLOCK_RESEARCH } from "../config/balance.js";
+import { spendResources } from "./humanEconomy.js";
+
+/**
+ * Instantly unlocks one building at the TownHall/Church where it's researched — a one-time
+ * purchase rather than a progressive multi-tick project like the abstract-bonus research above,
+ * which keeps a second research system tractable without duplicating all of advanceResearch's
+ * ticking machinery for what's fundamentally a simpler "pay once, permanently unlocked" purchase.
+ */
+export function handleResearchBuilding(room, player, msg) {
+  const ws = room.clients.get(player.id);
+  const optionId = msg.optionId;
+  const q = Number(msg.q), r = Number(msg.r);
+  if (!optionId || !Number.isFinite(q) || !Number.isFinite(r)) return;
+
+  const building = room.buildings.get(key(q, r));
+  if (!building || building.ownerId !== player.id) return send(ws, "build_rejected", { reason: "not_your_building" });
+  if (!building.constructed) return send(ws, "build_rejected", { reason: "still_constructing" });
+
+  const options = BUILDING_UNLOCK_RESEARCH[player.race]?.[building.kind];
+  const option = options?.find((o) => o.id === optionId);
+  if (!option) return send(ws, "build_rejected", { reason: "invalid_option" });
+
+  if (!player.buildingUnlocks) player.buildingUnlocks = new Set();
+  if (player.buildingUnlocks.has(option.id)) return send(ws, "build_rejected", { reason: "already_unlocked" });
+  if (!canAfford(player.bank, option.cost)) return send(ws, "build_rejected", { reason: "cannot_afford" });
+
+  spendResources(room, player, option.cost);
+  player.buildingUnlocks.add(option.id);
+  room._sendBank(ws, player);
+}
 
 export function handleResearch(room, player, msg) {
   const ws = room.clients.get(player.id);
@@ -26,7 +57,7 @@ export function handleResearch(room, player, msg) {
 
   if (!canAfford(player.bank, option.cost)) return send(ws, "build_rejected", { reason: "cannot_afford" });
 
-  spend(player.bank, option.cost);
+  spendResources(room, player, option.cost);
   player.pendingResearch = { optionId, ticksRemaining: option.ticks, totalTicks: option.ticks };
 
   room._sendBank(ws, player);

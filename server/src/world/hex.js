@@ -34,3 +34,38 @@ export function canEnterTerrain(t, allowHighMountain = false) {
   if (t.kind === "HighMountain") return allowHighMountain;
   return true;
 }
+
+/**
+ * Simple BFS path search through passable terrain — shared by anything server-side that needs
+ * autonomous multi-tile movement (bots, civilians). The client has its own equivalent
+ * (hex/Pathfinding.ts) for player-commanded movement; this is that same idea, server-side.
+ * Returns the full path INCLUDING the start tile, or null if unreachable within maxNodes.
+ */
+export function bfsPath(tiles, start, goal, passable = false, maxNodes = 600) {
+  const isPassable = typeof passable === "function" ? passable : (t) => canEnterTerrain(t, passable);
+  if (start.q === goal.q && start.r === goal.r) return [start];
+  const startK = key(start.q, start.r), goalK = key(goal.q, goal.r);
+  const seen = new Set([startK]);
+  const parent = new Map();
+  const queue = [start];
+  let head = 0, nodes = 0;
+
+  while (head < queue.length && nodes++ < maxNodes) {
+    const cur = queue[head++];
+    for (const n of neighbors(cur.q, cur.r)) {
+      const nk = key(n.q, n.r);
+      if (seen.has(nk)) continue;
+      if (!isPassable(tiles.getAt(n.q, n.r), n.q, n.r)) continue;
+      seen.add(nk);
+      parent.set(nk, cur);
+      if (nk === goalK) {
+        const path = [goal];
+        let p = goal;
+        while (key(p.q, p.r) !== startK) { p = parent.get(key(p.q, p.r)); path.push(p); }
+        return path.reverse();
+      }
+      queue.push(n);
+    }
+  }
+  return null; // unreachable within maxNodes -- caller should fall back to something else
+}

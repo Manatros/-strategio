@@ -8,9 +8,11 @@ import { log } from "./utils/logger.js";
 import { send, safeJSON } from "./net/wire.js";
 import { RoomManager } from "./rooms/RoomManager.js";
 import { uid } from "./utils/uid.js";
-import { upsertIdentity, getHighscores, getOwnedRaces, grantRaceEntitlement, getPlayerRecord, registerAccount, verifyAccountLogin, getIsAdmin, setAdmin } from "./persist/store.js";
+import { upsertIdentity, getHighscores, getOwnedRaces, grantRaceEntitlement, getPlayerRecord, registerAccount, verifyAccountLogin, getIsAdmin, setAdmin, setAdminByNameTag, getPlayerAchievements, getKeybindings, setKeybindings } from "./persist/store.js";
+import { ACHIEVEMENTS } from "./config/achievements.js";
 import { redirectToSteamLogin, handleSteamReturn } from "./auth/steam.js";
 import { RACES } from "./world/races.js";
+import { kickRandomBot, ensureBotsFilled } from "./rooms/bots.js";
 
 dotenv.config();
 
@@ -49,7 +51,43 @@ app.get("/admin/stats", (req, res) => {
   });
 });
 
-app.get("/highscores", async (_, res) => res.json({ highscores: await getHighscores(50) }));
+app.get("/highscores", async (req, res) => {
+  const sortBy = req.query.sortBy === "total" ? "total" : "best"; // whitelist -- anything else falls back to "best"
+  res.json({ highscores: await getHighscores(50, sortBy) });
+});
+
+// Lets the menu check with the server before showing "Resume Game" — a client-only localStorage
+// flag can go stale (grace period expired, game ended in another tab/device) and would otherwise
+// show a resume option that's actually dead.
+app.get("/can-resume/:token", (req, res) => {
+  res.json({ canResume: !!rm.findResumableRoom(req.params.token) });
+});
+
+// Full achievement definitions (name/description/category) plus which ones this specific player
+// has actually unlocked — the client needs both to render "here's everything, here's what you've
+// got" rather than only ever seeing achievements once they're already earned.
+app.get("/achievements/:token", async (req, res) => {
+  const records = await getPlayerAchievements(req.params.token);
+  res.json({ achievements: Object.values(ACHIEVEMENTS), unlocked: records.map((r) => r.id) });
+});
+
+// Keybindings are keyed by token, same trust model as every other per-token endpoint — the token
+// itself is the player's identity proof, no separate auth needed. This is what makes bindings
+// naturally follow an account across devices: logging in adopts the account's stable token (see
+// /auth/login), so the same row is read/written from wherever that token connects. Without an
+// account it's just a random per-browser token, so bindings persist on this browser but don't
+// follow anywhere else.
+app.get("/keybindings/:token", async (req, res) => {
+  const bindings = await getKeybindings(req.params.token);
+  res.json({ bindings });
+});
+
+app.post("/keybindings/:token", async (req, res) => {
+  const { bindings } = req.body || {};
+  if (!bindings || typeof bindings !== "object") return res.status(400).json({ error: "bindings object is required" });
+  await setKeybindings(req.params.token, bindings);
+  res.json({ ok: true });
+});
 
 // A player looks this up before showing the race picker (and to see their own Name#tag), so
 // locked races and their identity render correctly before they've even connected.
@@ -58,8 +96,7 @@ app.get("/races/:token", async (req, res) => {
     getPlayerRecord(req.params.token),
     getOwnedRaces(req.params.token),
   ]);
-  const effectiveOwned = process.env.DEV_UNLOCK_ALL_RACES === "1" ? [...RACES] : ownedRaces;
-  res.json({ ownedRaces: effectiveOwned, name: record?.name || null, tag: record?.tag || null });
+  res.json({ ownedRaces, name: record?.name || null, tag: record?.tag || null });
 });
 
 app.get("/auth/steam", redirectToSteamLogin);
@@ -124,7 +161,7 @@ app.post("/admin/grant-race", async (req, res) => {
   res.json({ granted, ownedRaces: await getOwnedRaces(token) });
 });
 
-/** Grants or revokes real admin status for an identity — the mechanism DEV_ALL_ADMIN is standing in for during development. */
+/** Grants or revokes admin status for an identity. This is now the only way to become admin — protected by ADMIN_SECRET. */
 app.post("/admin/set-admin", async (req, res) => {
   const secret = process.env.ADMIN_SECRET;
   if (!secret) return res.status(503).json({ error: "ADMIN_SECRET not configured" });
@@ -134,6 +171,21 @@ app.post("/admin/set-admin", async (req, res) => {
   if (typeof token !== "string") return res.status(400).json({ error: "token is required" });
   await setAdmin(token, !!isAdmin);
   res.json({ token, isAdmin: !!isAdmin });
+});
+
+// Same as above but looks the player up by name#tag — more convenient when you know who you want
+// to grant admin to but not their raw token. Requires that player to have connected at least once
+// already (there's no token to attach admin status to otherwise).
+app.post("/admin/set-admin-by-name", async (req, res) => {
+  const secret = process.env.ADMIN_SECRET;
+  if (!secret) return res.status(503).json({ error: "ADMIN_SECRET not configured" });
+  if (req.get("x-admin-secret") !== secret) return res.status(401).json({ error: "unauthorized" });
+
+  const { name, tag, isAdmin } = req.body || {};
+  if (typeof name !== "string" || typeof tag !== "string") return res.status(400).json({ error: "name and tag are required" });
+  const found = await setAdminByNameTag(name, tag, !!isAdmin);
+  if (!found) return res.status(404).json({ error: `no player found with name "${name}" and tag "${tag}" — they need to have connected at least once` });
+  res.json({ name, tag, isAdmin: !!isAdmin });
 });
 
 app.use(express.static(FRONTEND_DIST));
@@ -169,26 +221,38 @@ async function handleHandshake(ws, msg) {
 
   const identity = await upsertIdentity(token, { name, color });
 
-  // Human is always free; every other race must be owned. Set DEV_UNLOCK_ALL_RACES=1
-  // locally to skip this check while testing races you haven't "purchased".
-  const devUnlockAll = process.env.DEV_UNLOCK_ALL_RACES === "1";
+  // Every race is free — see persist/store.js's FREE_RACES. requestedRace just needs to be a real race.
+  const race = RACES.includes(requestedRace) ? requestedRace : "Human";
   const ownedRaces = await getOwnedRaces(token);
-  const race = devUnlockAll || ownedRaces.includes(requestedRace) ? requestedRace : "Human";
 
   if (mode === "auto") {
     const resumable = rm.findResumableRoom(token);
     if (resumable) {
       const clientId = resumable.resume(ws, token);
-      if (clientId) return { room: resumable, clientId };
+      if (clientId) {
+        ensureBotsFilled(resumable, cfg.targetLobbySize); // in case a bot died while this player was disconnected
+        return { room: resumable, clientId };
+      }
     }
   }
 
+  // Starting fresh (mode="new", or "auto" whose resume attempt above didn't pan out) — if this same
+  // token still has a disconnected-but-not-yet-reaped instance sitting in some other room, that old
+  // game is now genuinely abandoned. Surrender it explicitly (saves its score) rather than leaving
+  // it to linger until the grace period naturally expires.
+  const staleRoom = rm.findResumableRoom(token);
+  if (staleRoom) {
+    const stalePlayer = [...staleRoom.players.values()].find((p) => p.token === token && p.disconnectedAt !== null);
+    if (stalePlayer) staleRoom.handleSurrender(stalePlayer, "started_new_game_elsewhere");
+  }
+
   const room = rm.pickRoom();
-  // DEV_ALL_ADMIN=1 makes everyone admin, for the current development/testing phase. Once real
-  // accounts are the norm, unset this and use /admin/set-admin (or setAdmin() directly) instead —
-  // the real per-identity flag already works underneath this override, nothing else changes.
-  const isAdmin = process.env.DEV_ALL_ADMIN === "1" || await getIsAdmin(token);
-  const clientId = room.join(ws, { token, name, color, race, tag: identity.tag, ownedRaces: devUnlockAll ? null : ownedRaces, isAdmin });
+  const isAdmin = await getIsAdmin(token);
+  // Make room for the incoming real player if the lobby's already at its target size with bots
+  // filling it out — a bot-filled room isn't actually full for a real player's purposes.
+  if (room.players.size >= cfg.targetLobbySize) kickRandomBot(room);
+  const clientId = room.join(ws, { token, name, color, race, tag: identity.tag, ownedRaces, isAdmin });
+  ensureBotsFilled(room, cfg.targetLobbySize);
   rm.registerResumable(token, room.id);
   return { room, clientId };
 }
