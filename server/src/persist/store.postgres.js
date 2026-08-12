@@ -196,7 +196,7 @@ export async function recordGameEnd(token, finalScore, race, stats, isBot = fals
 // entitlement machinery below (grantRaceEntitlement, /admin/grant-race) is left in place since
 // it's harmless and could still be useful for something else later (e.g. a donation-linked
 // cosmetic), but nothing currently gates access behind it.
-const FREE_RACES = ["Human", "Orc", "Elf", "Dwarf", "Undead"];
+const FREE_RACES = ["Human", "Orc", "Elf", "Dwarf", "Undead", "Hive"];
 
 export async function getOwnedRaces(token) {
   await ensureSchema();

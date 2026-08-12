@@ -27,10 +27,41 @@ export function maxWorkersFor(building) {
 /** Ticks for a civilian's next step onto (q,r) — same road-speed logic as the player's own
  *  movement (see Room.js's stepCooldownFor), just expressed in ticks instead of milliseconds.
  *  Roads exist mainly to speed up worker traffic, so civilians benefit from them the same way. */
-function civilianStepTicks(room, q, r) {
+/** Every worker building (TownHall/Warehouse/gathering building etc.) this player owns that's
+ *  currently reachable from actual storage via roads/near-storage — these count as roads
+ *  themselves for civilian movement purposes (both passability and speed), not just for other
+ *  buildings' auto-connect goal-search (see tryAutoConnectRoad). Recomputed fresh each call, same
+ *  cost model as nearStorageTileKeys (iterates all buildings), which callers already pay. */
+function connectedBuildingTileKeys(room, playerId) {
+  const nearStorage = nearStorageTileKeys(room, playerId);
+  const storageBuildings = [...room.buildings.values()].filter(
+    (b) => b.ownerId === playerId && b.constructed && (b.kind === "TownHall" || b.kind === "Warehouse")
+  );
+  const roadPassable = (t, q, r) => {
+    const k = key(q, r);
+    if (nearStorage.has(k)) return canEnterTerrain(t, false);
+    const road = room.buildings.get(k);
+    return !!(road && road.kind === "Road" && road.constructed && road.ownerId === playerId);
+  };
+  const connected = new Set();
+  for (const b of room.buildings.values()) {
+    if (b.ownerId !== playerId || !b.constructed) continue;
+    const k = key(b.q, b.r);
+    if (nearStorage.has(k)) { connected.add(k); continue; }
+    for (const storage of storageBuildings) {
+      if (bfsPath(room.tiles, { q: b.q, r: b.r }, { q: storage.q, r: storage.r }, roadPassable, 300)) { connected.add(k); break; }
+    }
+  }
+  return connected;
+}
+
+function civilianStepTicks(room, q, r, connectedBuildings) {
   const road = room.buildings.get(key(q, r));
   if (road && road.kind === "Road" && road.constructed) {
     return ROAD_SPEED_TICKS[road.level ?? 1] ?? CIVILIAN_TICKS_PER_TILE;
+  }
+  if (connectedBuildings && connectedBuildings.has(key(q, r))) {
+    return ROAD_SPEED_TICKS[1] ?? CIVILIAN_TICKS_PER_TILE; // road-connected building — same speed as a basic road
   }
   return CIVILIAN_TICKS_PER_TILE;
 }
@@ -77,31 +108,49 @@ function startTrip(room, player, civilian, goal) {
   if (civilian.q === actualGoal.q && civilian.r === actualGoal.r) return { path: [], stepTicksRemaining: 0 };
 
   const nearStorage = nearStorageTileKeys(room, player.id);
+  const connectedBuildings = cachedConnectedBuildingTileKeys(room, player.id);
   const goalKey = key(actualGoal.q, actualGoal.r);
   const isPassable = (t, q, r) => {
     const k = key(q, r);
     if (k === goalKey) return canEnterTerrain(t, false); // always allowed to actually arrive
     if (nearStorage.has(k)) return canEnterTerrain(t, false); // last-mile exception near storage
-    const road = room.buildings.get(k);
-    return !!(road && road.kind === "Road" && road.constructed && road.ownerId === player.id);
+    const building = room.buildings.get(k);
+    if (building && building.kind === "Road" && building.constructed && building.ownerId === player.id) return true;
+    if (connectedBuildings.has(k)) return true; // a road-connected building counts as a road itself
+    return false;
   };
 
   const found = bfsPath(room.tiles, { q: civilian.q, r: civilian.r }, actualGoal, isPassable, 300);
   if (!found || found.length < 2) return null;
   const path = found.slice(1);
-  return { path, stepTicksRemaining: civilianStepTicks(room, path[0].q, path[0].r) };
+  return { path, stepTicksRemaining: civilianStepTicks(room, path[0].q, path[0].r, connectedBuildings) };
+}
+
+/** Same as connectedBuildingTileKeys, but cached per room per tick — every civilian's movement
+ *  step within the same tick reuses one computation instead of each redoing this BFS-based scan
+ *  independently, which would otherwise scale with (civilians moving this tick) × (buildings ×
+ *  storage buildings), a real cost with many civilians active at once. */
+function cachedConnectedBuildingTileKeys(room, playerId) {
+  if (!room._connectedBuildingsCache || room._connectedBuildingsCacheTick !== room.tickCount) {
+    room._connectedBuildingsCache = new Map();
+    room._connectedBuildingsCacheTick = room.tickCount;
+  }
+  if (!room._connectedBuildingsCache.has(playerId)) {
+    room._connectedBuildingsCache.set(playerId, connectedBuildingTileKeys(room, playerId));
+  }
+  return room._connectedBuildingsCache.get(playerId);
 }
 
 /** Advances one leg of an in-progress trip by a single tick. Returns true once the civilian has
  *  actually arrived (path fully walked) — false means still en route, try again next tick. */
-function advanceTripStep(room, civilian, trip) {
+function advanceTripStep(room, player, civilian, trip) {
   if (trip.path.length === 0) return true;
   trip.stepTicksRemaining -= 1;
   if (trip.stepTicksRemaining > 0) return false;
   const next = trip.path.shift();
   civilian.q = next.q; civilian.r = next.r;
   if (trip.path.length === 0) return true;
-  trip.stepTicksRemaining = civilianStepTicks(room, trip.path[0].q, trip.path[0].r);
+  trip.stepTicksRemaining = civilianStepTicks(room, trip.path[0].q, trip.path[0].r, cachedConnectedBuildingTileKeys(room, player.id));
   return false;
 }
 
@@ -163,6 +212,13 @@ export function tryAutoConnectRoad(room, player, building) {
     if (existing && existing.kind === "Road" && existing.ownerId === player.id) return; // already connected
   }
 
+  const isPassable = (t, q, r) => {
+    const k = key(q, r);
+    if (nearStorage.has(k)) return canEnterTerrain(t, false);
+    const road = room.buildings.get(k);
+    return !!(road && road.kind === "Road" && road.constructed && road.ownerId === player.id);
+  };
+
   const storageKeys = new Set();
   for (const b of room.buildings.values()) {
     if (b.ownerId !== player.id || !b.constructed) continue;
@@ -170,6 +226,22 @@ export function tryAutoConnectRoad(room, player, building) {
     storageKeys.add(key(b.q, b.r));
   }
   if (storageKeys.size === 0) return;
+
+  // A building connected to a road counts as a road itself: any other worker building that's
+  // already reachable from storage is an equally valid connection point for this new one, not just
+  // TownHall/Warehouse directly. Lets a cluster of buildings share one trunk road organically
+  // instead of every single one needing its own separate path all the way back to storage.
+  for (const b of room.buildings.values()) {
+    if (b.ownerId !== player.id || !b.constructed || b.id === building.id) continue;
+    if (!AUTO_ASSIGN_KINDS.has(b.kind)) continue;
+    const bKey = key(b.q, b.r);
+    if (storageKeys.has(bKey)) continue;
+    const reachable = [...storageKeys].some((goalKey) => {
+      const [gq, gr] = goalKey.split(",").map(Number);
+      return bfsPath(room.tiles, { q: b.q, r: b.r }, { q: gq, r: gr }, isPassable, 300);
+    });
+    if (reachable) storageKeys.add(bKey);
+  }
 
   const path = cheapestRoadPath(room, player.id, { q: building.q, r: building.r }, storageKeys, 600);
   if (!path || path.length < 2) return; // no reasonable connection found -- player can still hand-build one
@@ -186,7 +258,7 @@ export function tryAutoConnectRoad(room, player, building) {
     room.buildings.set(k, {
       id: uid(), kind: "Road", q: p.q, r: p.r, ownerId: player.id, workers: 0,
       constructed: true, ticksRemaining: 0, constructionTicks: 1, hp: 5, maxHp: 5,
-      lastAttackAt: 0, pendingTrain: null, level: 1,
+      lastAttackAt: 0, trainQueue: [], level: 1,
     });
   }
 }
@@ -201,6 +273,7 @@ export function tryAutoConnectRoad(room, player, building) {
  * frontier rather than a real heap — fine at this scale (runs once per building, not per tick).
  */
 function cheapestRoadPath(room, playerId, start, goalKeys, maxNodes = 600) {
+  const connectedBuildings = cachedConnectedBuildingTileKeys(room, playerId);
   const startK = key(start.q, start.r);
   if (goalKeys.has(startK)) return [start];
   const dist = new Map([[startK, 0]]);
@@ -225,10 +298,13 @@ function cheapestRoadPath(room, playerId, start, goalKeys, maxNodes = 600) {
       const isGoal = goalKeys.has(nk);
       const tile = room.tiles.getAt(n.q, n.r);
       if (!isGoal && !canEnterTerrain(tile, false)) continue;
+      const claim = room.claims.get(nk);
+      if (!isGoal && (!claim || claim.ownerId !== playerId)) continue; // roads can only be laid on your own claimed land
       const occupant = room.buildings.get(nk);
       const isExistingRoad = !!(occupant && occupant.kind === "Road" && occupant.ownerId === playerId);
-      if (occupant && !isExistingRoad && !isGoal) continue; // some other building in the way, can't route through it
-      const stepCost = isExistingRoad ? 0 : 1;
+      const isConnectedBuilding = connectedBuildings.has(nk);
+      if (occupant && !isExistingRoad && !isConnectedBuilding && !isGoal) continue; // some other building in the way, can't route through it
+      const stepCost = (isExistingRoad || isConnectedBuilding) ? 0 : 1;
       const nd = cur.d + stepCost;
       if (nd < (dist.get(nk) ?? Infinity)) {
         dist.set(nk, nd);
@@ -348,7 +424,7 @@ export function advanceCivilianTravel(room) {
   for (const [playerId, player] of room.players) {
     for (const civilian of player.units.values()) {
       if (civilian.kind !== "Civilian" || !civilian.travel) continue;
-      if (!advanceTripStep(room, civilian, civilian.travel)) continue;
+      if (!advanceTripStep(room, player, civilian, civilian.travel)) continue;
 
       const building = room.buildings.get(civilian.travel.toKey);
       // The building might have been demolished/destroyed/captured away while the civilian was en route.
@@ -461,7 +537,7 @@ export function advanceCivilianDelivery(room) {
       if (civilian.kind !== "Civilian") continue;
 
       if (civilian.delivery) {
-        if (!advanceTripStep(room, civilian, civilian.delivery)) continue;
+        if (!advanceTripStep(room, player, civilian, civilian.delivery)) continue;
 
         if (civilian.delivery.phase === "toStorage") {
           const storage = room.buildings.get(civilian.delivery.targetKey);
@@ -594,7 +670,7 @@ export function advanceCivilianReturnHome(room) {
   for (const player of room.players.values()) {
     for (const civilian of player.units.values()) {
       if (civilian.kind !== "Civilian" || !civilian.returningHome) continue;
-      if (!advanceTripStep(room, civilian, civilian.returningHome)) continue;
+      if (!advanceTripStep(room, player, civilian, civilian.returningHome)) continue;
       civilian.returningHome = null;
     }
   }
@@ -633,7 +709,7 @@ export function advanceWarehouseRoving(room) {
       if (civilian.kind !== "Civilian") continue;
 
       if (civilian.roving) {
-        if (!advanceTripStep(room, civilian, civilian.roving)) continue;
+        if (!advanceTripStep(room, player, civilian, civilian.roving)) continue;
 
         if (civilian.roving.phase === "toTarget") {
           const target = [...room.buildings.values()].find((b) => b.id === civilian.roving.targetBuildingId);

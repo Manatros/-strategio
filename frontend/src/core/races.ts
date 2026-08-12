@@ -1,5 +1,5 @@
 // src/core/races.ts
-export const RACES = ["Human", "Orc", "Elf", "Dwarf", "Undead"] as const;
+export const RACES = ["Human", "Orc", "Elf", "Dwarf", "Undead", "Hive"] as const;
 export type Race = (typeof RACES)[number];
 
 export type RaceDisplay = {
@@ -9,6 +9,9 @@ export type RaceDisplay = {
   unitNames: Record<string, string>;
   townHallTerrain: string;
   houseTerrain: string;
+  /** The player's own hero-unit title and weapon/archetype flavor — shown in the UI, no mechanical effect on its own. */
+  heroTitle: string;
+  heroWeapon: string;
 };
 
 export const RACE_DISPLAY: Record<Race, RaceDisplay> = {
@@ -19,6 +22,8 @@ export const RACE_DISPLAY: Record<Race, RaceDisplay> = {
     unitNames: { Soldier: "Soldier", Archer: "Archer", Scout: "Scout", Settler: "Settler", Builder: "Builder", Priest: "Priest" },
     townHallTerrain: "Grass",
     houseTerrain: "Grass",
+    heroTitle: "The King",
+    heroWeapon: "sword and shield",
   },
   Orc: {
     label: "Orc",
@@ -27,6 +32,8 @@ export const RACE_DISPLAY: Record<Race, RaceDisplay> = {
     unitNames: { Soldier: "Grunt", Archer: "Stonethrower", Scout: "Scout", Settler: "Settler", Brawler: "Brawler", Builder: "Digger", Priest: "Shaman" },
     townHallTerrain: "Grass",
     houseTerrain: "Grass",
+    heroTitle: "The Warchief",
+    heroWeapon: "a massive battle axe",
   },
   Elf: {
     label: "Elf",
@@ -35,6 +42,8 @@ export const RACE_DISPLAY: Record<Race, RaceDisplay> = {
     unitNames: { Soldier: "Soldier", Archer: "Archer", Scout: "Forager", Settler: "Settler", Builder: "Craftsman", Priest: "Druid" },
     townHallTerrain: "Forest",
     houseTerrain: "Forest",
+    heroTitle: "The Ranger-General",
+    heroWeapon: "a longbow",
   },
   Dwarf: {
     label: "Dwarf",
@@ -43,6 +52,8 @@ export const RACE_DISPLAY: Record<Race, RaceDisplay> = {
     unitNames: { Soldier: "Warrior", Archer: "Boomstick", Scout: "Scout", Settler: "Great Digger", Builder: "Mason", Priest: "Cleric" },
     townHallTerrain: "HighMountain",
     houseTerrain: "Stone",
+    heroTitle: "The Thane",
+    heroWeapon: "a heavy war mace",
   },
   Undead: {
     label: "Undead",
@@ -51,6 +62,22 @@ export const RACE_DISPLAY: Record<Race, RaceDisplay> = {
     unitNames: { Soldier: "Soldier", Archer: "Archer", Scout: "Scout", Settler: "Cryptkeeper", Necromancer: "Necromancer", Builder: "Ghoul", Priest: "Cultist" },
     townHallTerrain: "Grass",
     houseTerrain: "Grass",
+    heroTitle: "The Dark Sorcerer",
+    heroWeapon: "forbidden necromantic magic",
+  },
+  // Hive is a skeleton entry only — basics laid out (name, blurb, hero flavor) so the race exists
+  // and can be selected/extended, but none of its actual gameplay mechanics (corruption, swarm
+  // units, the counter-relationship with Elf's forests) are implemented yet. It currently plays
+  // identically to Human under the hood until that work happens.
+  Hive: {
+    label: "Hive",
+    blurb: "(In development) A swarm race — many low-health units, land corruption, countered by Elf's forests and cleansed by Priests.",
+    buildingNames: { TownHall: "Hive Cluster", House: "Brood Nest", Lumberjack: "Lumberjack", Mine: "Mine", Farm: "Farm", FishingBoat: "Fishing Boat", Garrison: "Spawning Pit", ArcherTower: "Archer Tower", Research: "Consciousness", Warehouse: "Larder", Outpost: "Outpost", Church: "Church" },
+    unitNames: { Soldier: "Drone", Archer: "Spitter", Scout: "Scout", Settler: "Settler", Builder: "Builder", Priest: "Priest" },
+    townHallTerrain: "Grass",
+    houseTerrain: "Grass",
+    heroTitle: "The Hive Leader",
+    heroWeapon: "claws and swarm instinct",
   },
 };
 

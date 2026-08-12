@@ -504,15 +504,21 @@ export class Room {
     if (!BUILD_COST[kind] || !Number.isFinite(q) || !Number.isFinite(r)) return;
 
     // TownHall placement still requires a nearby Settler (see below) — the actual founding
-    // mechanism for expanding to new territory. Every other building requires an available Builder
-    // within 1 tile — not already locked to another construction — which gets locked to this one
-    // for the duration; the client is responsible for auto-walking the closest available Builder
-    // into range before sending this message (see GameScene's placement flow).
+    // mechanism for expanding to new territory. Every other building can be placed either by the
+    // player's own hero character standing within 1 tile (unrestricted, like before Builders
+    // existed), or by an available Builder within 1 tile — not already locked to another
+    // construction — which gets locked to this one for the duration. The hero is checked first: if
+    // they're close enough, no Builder is needed or tied up, leaving Builders free to work
+    // elsewhere. The client is responsible for auto-walking the closest available Builder into
+    // range when the hero isn't nearby (see GameScene's placement flow).
     let builderId = null;
     if (kind !== "TownHall") {
-      const found = [...player.units].find(([, u]) => u.kind === "Builder" && !u.constructingBuildingId && hexDistance({ q: u.q, r: u.r }, { q, r }) <= 1);
-      if (!found) return send(ws, "build_rejected", { reason: "need_builder" });
-      builderId = found[0];
+      const heroNear = hexDistance({ q: player.q, r: player.r }, { q, r }) <= 1;
+      if (!heroNear) {
+        const found = [...player.units].find(([, u]) => u.kind === "Builder" && !u.constructingBuildingId && hexDistance({ q: u.q, r: u.r }, { q, r }) <= 1);
+        if (!found) return send(ws, "build_rejected", { reason: "need_builder" });
+        builderId = found[0];
+      }
     }
 
     const posKey = key(q, r);
@@ -856,19 +862,18 @@ export class Room {
           const rd = owner && raceOf(owner.race);
           if (owner && rd?.hasCivilians) {
             if (b.kind === "TownHall") {
-              // 1 Builder (a real unit, distinct from the Civilian worker economy) + one fewer
-              // Civilian than before, so every player starts with a Builder to actually construct
-              // things with. Free of popCost like a Civilian, with a matching +1 popCap, so this
-              // doesn't quietly eat into population capacity compared to the old all-Civilian spawn.
-              const civCount = Math.max(0, (rd.civiliansPerTownHall ?? 2) - 1);
-              spawnCivilians(this, owner, b, civCount);
+              // Full civiliansPerTownHall Civilians, same as before, plus a Builder — the Builder
+              // isn't a Civilian and can never be assigned to work a gathering/storage building,
+              // so unlike Civilians (which each grant +1 popCap, since population IS civilian
+              // count for Human), the Builder actually consumes a population slot instead.
+              spawnCivilians(this, owner, b, rd.civiliansPerTownHall ?? 2);
               const builderDef = UNIT_DEFS.Builder;
               const builderUnit = {
                 id: uid(), kind: "Builder", level: 1, guard: false, q: b.q, r: b.r,
-                lastStepAt: 0, lastActionAt: 0, hp: builderDef.hp, maxHp: builderDef.hp, popCost: 0,
+                lastStepAt: 0, lastActionAt: 0, hp: builderDef.hp, maxHp: builderDef.hp, popCost: 1,
               };
               owner.units.set(builderUnit.id, builderUnit);
-              owner.popCap += 1;
+              owner.usedWorkers += 1;
             } else {
               spawnCivilians(this, owner, b, rd.civiliansPerHouse ?? 4);
             }

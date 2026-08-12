@@ -13,7 +13,7 @@ export const BUILD_COST: Record<BuildingKind, Partial<Bank>> = {
   Garrison:    { Wood: 25, Stone: 20 },
   ArcherTower: { Wood: 20, Stone: 25 },
   Research:    { Wood: 50, Stone: 50 },
-  Warehouse:   { Wood: 10, Stone: 10 },
+  Warehouse:   { Wood: 50, Stone: 50 },
   Outpost:     { Wood: 20, Stone: 10 },
   Church:      { Wood: 30, Stone: 15, Bread: 15 },
   Road:        { Wood: 5, Stone: 5 },

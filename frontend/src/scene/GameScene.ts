@@ -929,10 +929,18 @@ export class GameScene implements Scene {
       return false;
     }
 
-    // Every other building needs an available Builder (not already locked to another
-    // construction) within 1 tile. If the closest available one isn't there yet, walk it into
-    // range instead of the player character — the server is the actual authority on this and will
+    // Every other building can be placed either by the hero character standing within 1 tile
+    // (unrestricted, checked first so a nearby Builder isn't needlessly tied up), or by an
+    // available Builder within 1 tile. If neither is close enough yet, walk the closest available
+    // Builder into range instead of the hero — the server is the actual authority on this and will
     // reject if we're wrong about who's available by the time this arrives.
+    if (hexDistance(this.player.pos, target) <= 1) {
+      this.ws.placeBuilding(kind, target.q, target.r);
+      this.sound.playSfx("build_place");
+      this.pendingBuildPlacement = null;
+      return true;
+    }
+
     const builder = this.closestAvailableBuilder(target);
     if (builder && hexDistance(builder.pos, target) <= 1) {
       this.ws.placeBuilding(kind, target.q, target.r);
@@ -1178,7 +1186,7 @@ export class GameScene implements Scene {
 
   /** Tab cycles through the player's own units, wrapping back to the main character after the last one. */
   private cycleSelectedUnit() {
-    const ids = [...this.units.keys()];
+    const ids = [...this.units.keys()].filter(id => this.unitKinds.get(id) !== "Civilian");
     if (ids.length === 0) { this.setSingleSelection(null); this.refreshUnitPanel(); return; }
     const curIdx = this.selectedUnitId ? ids.indexOf(this.selectedUnitId) : -1;
     const nextIdx = curIdx + 1;
@@ -1325,6 +1333,8 @@ export class GameScene implements Scene {
     let nearRequirement: boolean;
     if (this.buildKind === "TownHall") {
       nearRequirement = this.nearOwnSettler({ q, r });
+    } else if (hexDistance(this.player.pos, { q, r }) <= 1) {
+      nearRequirement = true;
     } else {
       const builder = this.closestAvailableBuilder({ q, r });
       nearRequirement = !!builder && hexDistance(builder.pos, { q, r }) <= 1;
@@ -1344,7 +1354,7 @@ export class GameScene implements Scene {
     this.ghost.x = x; this.ghost.y = y;
     this.ghost.visible = true;
 
-    this.updateRoadPreview(q, r, ok);
+    this.updateRoadPreview(q, r, this.canBuildOn(this.buildKind, tile));
   }
 
   /** Previews the auto-generated road connection a worker building would get if placed here — a
@@ -1353,9 +1363,18 @@ export class GameScene implements Scene {
    *  war may leave this incomplete, but the actual connection is server-authoritative regardless —
    *  this is a preview, not a guarantee). Silently shows nothing if this building kind doesn't need
    *  a road, or no connection is found. */
-  private updateRoadPreview(q: number, r: number, placementOk: boolean) {
+  /** Previews the auto-generated road connection a worker building would get if placed here — a
+   *  client-side mirror of the server's cheapestRoadPath (existing roads free, everything else
+   *  costs 1, restricted to claimed territory), using whatever the client currently knows (fog of
+   *  war may leave this incomplete, but the actual connection is server-authoritative regardless —
+   *  this is a preview, not a guarantee). Shows regardless of whether a Builder is currently in
+   *  range — the whole point is letting the player see the road before walking a Builder there —
+   *  just dimmer when out of range, to distinguish "preview" from "ready to place right now".
+   *  Silently shows nothing if this building kind doesn't need a road, terrain is invalid, or no
+   *  connection is found. */
+  private updateRoadPreview(q: number, r: number, terrainValid: boolean) {
     this.roadPreview.clear();
-    if (!placementOk || this.myRace !== "Human" || !this.buildKind || !ROAD_NEEDING_KINDS.has(this.buildKind)) return;
+    if (!terrainValid || this.myRace !== "Human" || !this.buildKind || !ROAD_NEEDING_KINDS.has(this.buildKind)) return;
 
     const nearStorage = new Set<string>();
     const storageGoals: Axial[] = [];
@@ -1372,24 +1391,30 @@ export class GameScene implements Scene {
     const path = this.previewCheapestRoadPath({ q, r }, storageGoals);
     if (!path || path.length < 2) return;
 
+    const heroInRange = hexDistance(this.player.pos, { q, r }) <= 1;
+    const builder = this.closestAvailableBuilder({ q, r });
+    const builderInRange = !!builder && hexDistance(builder.pos, { q, r }) <= 1;
+    const alpha = (heroInRange || builderInRange) ? 0.75 : 0.4;
+
     const startPx = axialToPixel(path[0], this.hexSize);
     this.roadPreview.moveTo(startPx.x, startPx.y);
     for (let i = 1; i < path.length; i++) {
       const { x: px, y: py } = axialToPixel(path[i], this.hexSize);
       this.roadPreview.lineTo(px, py);
     }
-    this.roadPreview.stroke({ color: 0xd9a86c, width: 4, alpha: 0.75 });
+    this.roadPreview.stroke({ color: 0xd9a86c, width: 4, alpha });
     for (const p of path) {
       const { x: px, y: py } = axialToPixel(p, this.hexSize);
-      this.roadPreview.circle(px, py, 3).fill({ color: 0xd9a86c, alpha: 0.9 });
+      this.roadPreview.circle(px, py, 3).fill({ color: 0xd9a86c, alpha: Math.min(0.9, alpha + 0.15) });
     }
   }
 
   /** Client-side mirror of the server's civilians.js cheapestRoadPath — small weighted Dijkstra,
-   *  existing roads cost 0 (free reuse), everything else costs 1, restricted to claimed territory.
-   *  Preview only; the server computes the real connection independently when the building is
-   *  actually placed. */
+   *  existing roads AND buildings already connected to the road network are free (0-cost) to route
+   *  through, everything else costs 1, restricted to claimed territory. Preview only; the server
+   *  computes the real connection independently when the building is actually placed. */
   private previewCheapestRoadPath(start: Axial, goals: Axial[]): Axial[] | null {
+    const connectedBuildings = this.connectedBuildingKeys();
     const goalKeys = new Set(goals.map((g) => keyFor(g.q, g.r)));
     const startK = keyFor(start.q, start.r);
     if (goalKeys.has(startK)) return [start];
@@ -1418,8 +1443,9 @@ export class GameScene implements Scene {
         if (!isGoal && tile?.claimedBy?.id !== this.myId) continue;
         const occupant = this.buildingSprites.get(nk);
         const isExistingRoad = !!(occupant && occupant.kind === "Road" && occupant.ownerId === this.myId);
-        if (occupant && !isExistingRoad && !isGoal) continue;
-        const stepCost = isExistingRoad ? 0 : 1;
+        const isConnectedBuilding = connectedBuildings.has(nk);
+        if (occupant && !isExistingRoad && !isConnectedBuilding && !isGoal) continue;
+        const stepCost = (isExistingRoad || isConnectedBuilding) ? 0 : 1;
         const nd = cur.d + stepCost;
         if (nd < (dist.get(nk) ?? Infinity)) {
           dist.set(nk, nd);
@@ -1430,6 +1456,62 @@ export class GameScene implements Scene {
       }
     }
     return null;
+  }
+
+  /** Every one of this player's own worker buildings currently reachable from actual storage via
+   *  roads/near-storage — client-side mirror of the server's connectedBuildingTileKeys, used both
+   *  for the road preview and to keep it visually consistent with what civilians can actually walk
+   *  through. Best-effort: the client only knows about buildings it's currently aware of. */
+  private connectedBuildingKeys(): Set<string> {
+    const nearStorage = new Set<string>();
+    const storageBuildings: RemoteBuilding[] = [];
+    for (const b of this.buildingSprites.values()) {
+      if (b.ownerId !== this.myId || !b.constructed) continue;
+      if (b.kind !== "TownHall" && b.kind !== "Warehouse") continue;
+      storageBuildings.push(b);
+      nearStorage.add(keyFor(b.q, b.r));
+      for (const n of neighbors({ q: b.q, r: b.r })) nearStorage.add(keyFor(n.q, n.r));
+    }
+    const connected = new Set<string>();
+    for (const b of this.buildingSprites.values()) {
+      if (b.ownerId !== this.myId || !b.constructed) continue;
+      const k = keyFor(b.q, b.r);
+      if (nearStorage.has(k)) { connected.add(k); continue; }
+      for (const storage of storageBuildings) {
+        if (this.bfsRoadOnly({ q: b.q, r: b.r }, { q: storage.q, r: storage.r }, nearStorage)) { connected.add(k); break; }
+      }
+    }
+    return connected;
+  }
+
+  /** Simple unweighted BFS using only actual roads and the near-storage zone as passable — checks
+   *  reachability for connectedBuildingKeys, mirroring the server's road-restricted civilian
+   *  movement rules (not the weighted road-laying pathfinder above). Returns a truthy value if
+   *  reachable at all; the exact path isn't needed by callers. */
+  private bfsRoadOnly(start: Axial, goal: Axial, nearStorage: Set<string>): boolean {
+    const startK = keyFor(start.q, start.r);
+    const goalK = keyFor(goal.q, goal.r);
+    if (startK === goalK) return true;
+    const seen = new Set([startK]);
+    const queue: Axial[] = [start];
+    let head = 0, nodes = 0;
+    while (head < queue.length && nodes++ < 300) {
+      const cur = queue[head++];
+      for (const n of neighbors(cur)) {
+        const nk = keyFor(n.q, n.r);
+        if (seen.has(nk)) continue;
+        if (nk === goalK) return true;
+        const tile = this.tiles.get(nk);
+        const isNearStorage = nearStorage.has(nk);
+        const occupant = this.buildingSprites.get(nk);
+        const isRoad = !!(occupant && occupant.kind === "Road" && occupant.ownerId === this.myId);
+        if (!isNearStorage && !isRoad) continue;
+        if (!this.canEnterTile(tile)) continue;
+        seen.add(nk);
+        queue.push(n);
+      }
+    }
+    return false;
   }
 
   private hexAdj(a: { q: number; r: number }, b: { q: number; r: number }) {
